@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Track Diagram Creator</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #0f0f11;
+        }
+        #toolbar {
+            background-color: #1c1c1f;
+            color: #e4e4e7;
+            padding: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+            border-bottom: 1px solid #2e2e33;
+        }
+        .tool-group {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+            border-right: 1px solid #3f3f46;
+            padding-right: 15px;
+        }
+        .tool-group:last-child {
+            border-right: none;
+        }
+        button {
+            background-color: #2a2a2e;
+            color: #e4e4e7;
+            border: 1px solid #3f3f46;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: 0.1s;
+        }
+        button:hover { background-color: #3f3f46; }
+        button:disabled { opacity: 0.45; cursor: default; }
+        button:disabled:hover { background-color: #2a2a2e; }
+        button.active { background-color: #3b82f6; border-color: #2563eb; color: #ffffff; }
+        
+        #canvas-container {
+            flex-grow: 1;
+            position: relative;
+            overflow: hidden;
+            background-color: #17171a;
+            cursor: crosshair;
+        }
+        canvas {
+            display: block;
+        }
+        label { font-size: 14px; color: #d4d4d8; }
+        input[type="range"] { vertical-align: middle; accent-color: #3b82f6; }
+        input[type="color"] {
+            border: 1px solid #3f3f46;
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            cursor: pointer;
+            padding: 0;
+            background: transparent;
+        }
+        
+        .hint {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.75);
+            color: #e4e4e7;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+        }
+
+        /* --- Custom Modal (replaces window.prompt) --- */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.65);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-overlay.hidden { display: none; }
+        .modal-box {
+            background: #1c1c1f;
+            border: 1px solid #2e2e33;
+            border-radius: 8px;
+            padding: 20px;
+            width: 280px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .modal-box h3 {
+            margin: 0 0 14px 0;
+            font-size: 16px;
+            color: #f4f4f5;
+        }
+        .modal-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-bottom: 12px;
+        }
+        .modal-field label {
+            font-size: 12px;
+            color: #a1a1aa;
+        }
+        .modal-field input[type="text"],
+        .modal-field input[type="number"] {
+            font-size: 14px;
+            padding: 6px 8px;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            background-color: #131315;
+            color: #f4f4f5;
+        }
+        .modal-field-checkbox label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #e4e4e7;
+        }
+        .modal-field-checkbox input {
+            width: 16px;
+            height: 16px;
+            padding: 0;
+            accent-color: #3b82f6;
+        }
+        .modal-box {
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-field input:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .modal-actions button {
+            color: #e4e4e7;
+        }
+        .modal-actions button#modal-save {
+            background-color: #3b82f6;
+            border-color: #2563eb;
+            color: white;
+        }
+        .modal-actions button#modal-save:hover { background-color: #2563eb; }
+        .modal-actions button#modal-cancel {
+            background-color: #2a2a2e;
+            border: 1px solid #3f3f46;
+        }
+        .modal-actions button#modal-cancel:hover { background-color: #3f3f46; }
+    </style>
+</head>
+<body>
+
+    <div id="toolbar">
+        <div class="tool-group">
+            <button id="btn-select" class="active" data-mode="select">Pointer / Edit</button>
+            <button id="btn-track" data-mode="track">Add Track</button>
+            <button id="btn-split" data-mode="split">Split Track</button>
+            <button id="btn-platform" data-mode="platform">Add Platform</button>
+            <button id="btn-signal" data-mode="signal">Add Signal</button>
+            <button id="btn-label" data-mode="label">Add Text Label</button>
+            <button id="btn-delete" data-mode="delete">Delete Mode</button>
+        </div>
+        <div class="tool-group">
+            <button id="btn-overpass" disabled>Toggle Overpass</button>
+            <button id="btn-edit-track" disabled>Edit Track Info</button>
+            <button id="btn-edit-platform" disabled>Edit Platform Info</button>
+            <button id="btn-edit-label" disabled>Edit Label Text</button>
+            <label for="elem-color" style="margin-left: 5px;">Color:</label>
+            <input type="color" id="elem-color" value="#e4e4e7">
+        </div>
+        <div class="tool-group">
+            <button id="btn-toggle-signal" disabled>Toggle Signal (Red/Blue)</button>
+            <button id="btn-flip-signal" disabled>Flip Signal Direction</button>
+        </div>
+        <div class="tool-group">
+            <label for="grid-size">Grid Size:</label>
+            <input type="range" id="grid-size" min="20" max="100" value="40">
+            <span id="grid-val">40</span>
+            <button id="btn-toggle-diagonal-grid">Diagonal Grid: Off</button>
+        </div>
+        <div class="tool-group">
+            <button id="btn-export">Export</button>
+            <button id="btn-import-trigger">Import</button>
+            <input type="file" id="import-file" style="display: none;" accept=".json">
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="canvas"></canvas>
+        <div class="hint">Right-click + drag to Pan | Scroll to Zoom | Drag a signal's circle to reposition it - the post leaves the track perpendicular, then routes to the head in clean 45°-ish legs | Signals are directional: the arrow shows which travel direction sees the light</div>
+    </div>
+
+    <div id="edit-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-box">
+            <h3 id="modal-title">Edit</h3>
+            <div id="modal-fields"></div>
+            <div class="modal-actions">
+                <button id="modal-cancel">Cancel</button>
+                <button id="modal-save">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
