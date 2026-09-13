@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Track Diagram Creator</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #0f0f11;
+        }
+        #toolbar {
+            background-color: #1c1c1f;
+            color: #e4e4e7;
+            padding: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+            border-bottom: 1px solid #2e2e33;
+        }
+        .tool-group {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+            border-right: 1px solid #3f3f46;
+            padding-right: 15px;
+        }
+        .tool-group:last-child {
+            border-right: none;
+        }
+        button {
+            background-color: #2a2a2e;
+            color: #e4e4e7;
+            border: 1px solid #3f3f46;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: 0.1s;
+        }
+        button:hover { background-color: #3f3f46; }
+        button:disabled { opacity: 0.45; cursor: default; }
+        button:disabled:hover { background-color: #2a2a2e; }
+        button.active { background-color: #3b82f6; border-color: #2563eb; color: #ffffff; }
+        
+        #canvas-container {
+            flex-grow: 1;
+            position: relative;
+            overflow: hidden;
+            background-color: #17171a;
+            cursor: crosshair;
+        }
+        canvas {
+            display: block;
+        }
+        label { font-size: 14px; color: #d4d4d8; }
+        input[type="range"] { vertical-align: middle; accent-color: #3b82f6; }
+        input[type="color"] {
+            border: 1px solid #3f3f46;
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            cursor: pointer;
+            padding: 0;
+            background: transparent;
+        }
+        
+        .hint {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.75);
+            color: #e4e4e7;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+        }
+
+        /* --- Custom Modal (replaces window.prompt) --- */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.65);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-overlay.hidden { display: none; }
+        .modal-box {
+            background: #1c1c1f;
+            border: 1px solid #2e2e33;
+            border-radius: 8px;
+            padding: 20px;
+            width: 280px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .modal-box h3 {
+            margin: 0 0 14px 0;
+            font-size: 16px;
+            color: #f4f4f5;
+        }
+        .modal-field {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-bottom: 12px;
+        }
+        .modal-field label {
+            font-size: 12px;
+            color: #a1a1aa;
+        }
+        .modal-field input[type="text"],
+        .modal-field input[type="number"] {
+            font-size: 14px;
+            padding: 6px 8px;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            background-color: #131315;
+            color: #f4f4f5;
+        }
+        .modal-field-checkbox label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: #e4e4e7;
+        }
+        .modal-field-checkbox input {
+            width: 16px;
+            height: 16px;
+            padding: 0;
+            accent-color: #3b82f6;
+        }
+        .modal-box {
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-field input:focus {
+            outline: none;
+            border-color: #3b82f6;
+        }
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .modal-actions button {
+            color: #e4e4e7;
+        }
+        .modal-actions button#modal-save {
+            background-color: #3b82f6;
+            border-color: #2563eb;
+            color: white;
+        }
+        .modal-actions button#modal-save:hover { background-color: #2563eb; }
+        .modal-actions button#modal-cancel {
+            background-color: #2a2a2e;
+            border: 1px solid #3f3f46;
+        }
+        .modal-actions button#modal-cancel:hover { background-color: #3f3f46; }
+
+        /* --- Line Manager --- */
+        .line-entry {
+            border: 1px solid #2e2e33;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 12px;
+            background: #141416;
+        }
+        .line-entry-header {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .line-entry-header input[type="text"] {
+            flex-grow: 1;
+            font-size: 13px;
+            padding: 5px 7px;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            background-color: #131315;
+            color: #f4f4f5;
+        }
+        .line-entry-header input[type="color"] {
+            width: 26px;
+            height: 26px;
+        }
+        .line-entry-header button {
+            padding: 4px 8px;
+            font-size: 12px;
+        }
+        .line-stops-list {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .line-stop-row {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            font-size: 12px;
+            color: #d4d4d8;
+            background: #1c1c1f;
+            border-radius: 4px;
+            padding: 5px 6px;
+        }
+        .stop-row-top {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .stop-row-top .stop-label {
+            flex-grow: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 600;
+            color: #f4f4f5;
+        }
+        .stop-row-top button {
+            padding: 1px 6px;
+            font-size: 11px;
+            line-height: 1.4;
+        }
+        .stop-platforms {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            padding-left: 2px;
+        }
+        .stop-platform-chip {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            background: #26262b;
+            border: 1px solid #3f3f46;
+            border-radius: 10px;
+            padding: 2px 4px 2px 8px;
+            font-size: 11px;
+            color: #d4d4d8;
+        }
+        .stop-platform-chip button {
+            padding: 0 4px;
+            font-size: 10px;
+            line-height: 1.4;
+            border: none;
+            background: transparent;
+            color: #a1a1aa;
+            cursor: pointer;
+        }
+        .stop-platform-chip button:hover {
+            color: #ef4444;
+            background: transparent;
+        }
+        .line-empty-note {
+            font-size: 12px;
+            color: #71717a;
+            font-style: italic;
+        }
+
+        /* --- Demand Editor --- */
+        .demand-modal-box {
+            width: 900px;
+            max-width: 96vw;
+        }
+        .demand-global-box {
+            border: 1px solid #2e2e33;
+            border-radius: 6px;
+            padding: 10px 12px;
+            background: #141416;
+            margin-bottom: 14px;
+        }
+        .demand-global-box .demand-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .demand-global-box input[type="range"] {
+            flex-grow: 1;
+        }
+        .demand-hint {
+            font-size: 11px;
+            color: #a1a1aa;
+            margin-top: 4px;
+        }
+        .demand-layout {
+            display: flex;
+            gap: 16px;
+        }
+        .demand-groups-col {
+            width: 190px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .demand-groups-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-height: 260px;
+            overflow-y: auto;
+        }
+        .demand-group-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 8px;
+            border-radius: 4px;
+            background: #141416;
+            border: 1px solid #2e2e33;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .demand-group-item.active {
+            border-color: #3b82f6;
+            background: #1c2333;
+        }
+        .demand-group-item .swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            border: 1px solid rgba(255,255,255,0.3);
+        }
+        .demand-group-item .gname {
+            flex-grow: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .demand-group-item button {
+            padding: 1px 5px;
+            font-size: 11px;
+        }
+        .demand-main-col {
+            flex-grow: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            max-height: 560px;
+            overflow-y: auto;
+            padding-right: 4px;
+        }
+        .demand-section-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #e4e4e7;
+            margin-bottom: 8px;
+        }
+        .demand-station-select {
+            width: 100%;
+            margin-bottom: 10px;
+            background-color: #131315;
+            color: #f4f4f5;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            padding: 6px 8px;
+            font-size: 13px;
+        }
+        .demand-curve-box {
+            border: 1px solid #2e2e33;
+            border-radius: 6px;
+            padding: 10px;
+            background: #141416;
+            margin-bottom: 10px;
+        }
+        .demand-graph-svg {
+            width: 100%;
+            height: auto;
+            background: #101012;
+            border-radius: 4px;
+            touch-action: none;
+        }
+        .demand-point-editor {
+            display: none;
+            gap: 6px;
+            align-items: center;
+            margin-top: 8px;
+            background: #1c1c1f;
+            padding: 6px;
+            border-radius: 4px;
+            flex-wrap: wrap;
+        }
+        .demand-point-editor input[type="text"],
+        .demand-point-editor input[type="number"] {
+            background: #131315;
+            border: 1px solid #3f3f46;
+            color: #f4f4f5;
+            border-radius: 4px;
+            padding: 4px 6px;
+            font-size: 12px;
+        }
+        .demand-point-editor .dc-time { width: 52px; }
+        .demand-point-editor .dc-intensity { width: 58px; }
+        .demand-point-editor label {
+            font-size: 11px;
+            color: #a1a1aa;
+        }
+        .demand-point-editor button {
+            padding: 2px 7px;
+            font-size: 11px;
+        }
+        .demand-empty-note {
+            font-size: 12px;
+            color: #71717a;
+            font-style: italic;
+        }
+        .demand-add-group-row {
+            display: flex;
+            gap: 6px;
+        }
+        .demand-add-group-row input[type="text"] {
+            flex-grow: 1;
+            font-size: 12px;
+            padding: 5px 7px;
+            border: 1px solid #3f3f46;
+            border-radius: 4px;
+            background-color: #131315;
+            color: #f4f4f5;
+        }
+        .demand-add-group-row input[type="color"] {
+            width: 26px;
+            height: 26px;
+        }
+        .demand-no-station-note {
+            font-size: 12px;
+            color: #71717a;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="toolbar">
+        <div class="tool-group">
+            <button id="btn-select" class="active" data-mode="select">Pointer / Edit</button>
+            <button id="btn-track" data-mode="track">Add Track</button>
+            <button id="btn-split" data-mode="split">Split Track</button>
+            <button id="btn-platform" data-mode="platform">Add Platform</button>
+            <button id="btn-signal" data-mode="signal">Add Signal</button>
+            <button id="btn-label" data-mode="label">Add Text Label</button>
+            <button id="btn-delete" data-mode="delete">Delete Mode</button>
+        </div>
+        <div class="tool-group">
+            <button id="btn-overpass" disabled>Toggle Overpass</button>
+            <button id="btn-edit-track" disabled>Edit Track Info</button>
+            <button id="btn-edit-platform" disabled>Edit Platform Info</button>
+            <button id="btn-edit-label" disabled>Edit Label Text</button>
+            <label for="elem-color" style="margin-left: 5px;">Color:</label>
+            <input type="color" id="elem-color" value="#e4e4e7">
+        </div>
+        <div class="tool-group">
+            <button id="btn-toggle-signal" disabled>Toggle Signal (Red/Blue)</button>
+            <button id="btn-flip-signal" disabled>Flip Signal Direction</button>
+        </div>
+        <div class="tool-group">
+            <button id="btn-line" data-mode="line">Add Line / Stations</button>
+            <select id="line-select"><option value="">(no line selected)</option></select>
+            <button id="btn-new-line">New Line</button>
+            <button id="btn-manage-lines">Manage Lines</button>
+        </div>
+        <div class="tool-group">
+            <label for="grid-size">Grid Size:</label>
+            <input type="range" id="grid-size" min="20" max="100" value="40">
+            <span id="grid-val">40</span>
+            <button id="btn-toggle-diagonal-grid">Diagonal Grid: Off</button>
+        </div>
+        <div class="tool-group">
+            <button id="btn-demand">Demand Editor</button>
+        </div>
+        <div class="tool-group">
+            <button id="btn-export">Export</button>
+            <button id="btn-import-trigger">Import</button>
+            <input type="file" id="import-file" style="display: none;" accept=".json">
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="canvas"></canvas>
+        <div class="hint">Right-click + drag to Pan | Scroll to Zoom | Drag a signal's circle to reposition it - the post leaves the track perpendicular, then routes to the head in clean 45°-ish legs | Signals are directional: the arrow shows which travel direction sees the light | In "Add Line / Stations" mode, pick a line then click platforms in order to append them as station stops - click another platform at the same station right after to add it to that stop too (e.g. a no-turnback terminus with separate arrival/departure platforms); hold Shift to force a new stop at the same station instead</div>
+    </div>
+
+    <div id="edit-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-box">
+            <h3 id="modal-title">Edit</h3>
+            <div id="modal-fields"></div>
+            <div class="modal-actions">
+                <button id="modal-cancel">Cancel</button>
+                <button id="modal-save">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="line-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-box" style="width: 360px;">
+            <h3>Manage Lines</h3>
+            <div id="line-modal-body"></div>
+            <div class="modal-actions">
+                <button id="line-modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="demand-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-box demand-modal-box">
+            <h3>Demand Editor</h3>
+
+            <div class="demand-global-box">
+                <div class="demand-row">
+                    <label for="demand-transfer-aversion" style="min-width: 160px;">Passenger transfer aversion:</label>
+                    <input type="range" id="demand-transfer-aversion" min="0" max="100" value="70">
+                    <span id="demand-transfer-aversion-val">70</span>
+                </div>
+                <div class="demand-hint">Passengers will change trains to complete a trip, but a higher value makes them favor routes with fewer interchanges more strongly.</div>
+            </div>
+
+            <div class="demand-layout">
+                <div class="demand-groups-col">
+                    <div class="demand-section-title">Groups</div>
+                    <div id="demand-groups-list" class="demand-groups-list"></div>
+                    <div class="demand-add-group-row">
+                        <input type="text" id="demand-new-group-name" placeholder="e.g. To Work">
+                        <input type="color" id="demand-new-group-color" value="#3b82f6">
+                    </div>
+                    <button id="demand-add-group-btn">+ Add Group</button>
+                </div>
+                <div class="demand-main-col" id="demand-main-col">
+                    <div class="demand-no-station-note">Select or create a group to edit its demand.</div>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="demand-modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

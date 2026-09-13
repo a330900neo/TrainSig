@@ -1,228 +1,207 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Advanced Track Diagram Creator</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-            height: 100vh;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #0f0f11;
-        }
-        #toolbar {
-            background-color: #1c1c1f;
-            color: #e4e4e7;
-            padding: 10px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 15px;
-            align-items: center;
-            border-bottom: 1px solid #2e2e33;
-        }
-        .tool-group {
-            display: flex;
-            gap: 5px;
-            align-items: center;
-            border-right: 1px solid #3f3f46;
-            padding-right: 15px;
-        }
-        .tool-group:last-child {
-            border-right: none;
-        }
-        button {
-            background-color: #2a2a2e;
-            color: #e4e4e7;
-            border: 1px solid #3f3f46;
-            padding: 6px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: 0.1s;
-        }
-        button:hover { background-color: #3f3f46; }
-        button:disabled { opacity: 0.45; cursor: default; }
-        button:disabled:hover { background-color: #2a2a2e; }
-        button.active { background-color: #3b82f6; border-color: #2563eb; color: #ffffff; }
-        
-        #canvas-container {
-            flex-grow: 1;
-            position: relative;
-            overflow: hidden;
-            background-color: #17171a;
-            cursor: crosshair;
-        }
-        canvas {
-            display: block;
-        }
-        label { font-size: 14px; color: #d4d4d8; }
-        input[type="range"] { vertical-align: middle; accent-color: #3b82f6; }
-        input[type="color"] {
-            border: 1px solid #3f3f46;
-            width: 30px;
-            height: 30px;
-            border-radius: 4px;
-            cursor: pointer;
-            padding: 0;
-            background: transparent;
-        }
-        
-        .hint {
-            position: absolute;
-            bottom: 10px;
-            left: 10px;
-            background: rgba(0,0,0,0.75);
-            color: #e4e4e7;
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 12px;
-            pointer-events: none;
-        }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TrainSig</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
 
-        /* --- Custom Modal (replaces window.prompt) --- */
-        .modal-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(0,0,0,0.65);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-        .modal-overlay.hidden { display: none; }
-        .modal-box {
-            background: #1c1c1f;
-            border: 1px solid #2e2e33;
-            border-radius: 8px;
-            padding: 20px;
-            width: 280px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        .modal-box h3 {
-            margin: 0 0 14px 0;
-            font-size: 16px;
-            color: #f4f4f5;
-        }
-        .modal-field {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            margin-bottom: 12px;
-        }
-        .modal-field label {
-            font-size: 12px;
-            color: #a1a1aa;
-        }
-        .modal-field input[type="text"],
-        .modal-field input[type="number"] {
-            font-size: 14px;
-            padding: 6px 8px;
-            border: 1px solid #3f3f46;
-            border-radius: 4px;
-            background-color: #131315;
-            color: #f4f4f5;
-        }
-        .modal-field-checkbox label {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 14px;
-            color: #e4e4e7;
-        }
-        .modal-field-checkbox input {
-            width: 16px;
-            height: 16px;
-            padding: 0;
-            accent-color: #3b82f6;
-        }
-        .modal-box {
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-        .modal-field input:focus {
-            outline: none;
-            border-color: #3b82f6;
-        }
-        .modal-actions {
-            display: flex;
-            justify-content: flex-end;
-            gap: 8px;
-            margin-top: 8px;
-        }
-        .modal-actions button {
-            color: #e4e4e7;
-        }
-        .modal-actions button#modal-save {
-            background-color: #3b82f6;
-            border-color: #2563eb;
-            color: white;
-        }
-        .modal-actions button#modal-save:hover { background-color: #2563eb; }
-        .modal-actions button#modal-cancel {
-            background-color: #2a2a2e;
-            border: 1px solid #3f3f46;
-        }
-        .modal-actions button#modal-cancel:hover { background-color: #3f3f46; }
-    </style>
+  :root{
+    --bg: #0f0f11;
+    --panel: #17171a;
+    --line: #2e2e33;
+    --text: #e4e4e7;
+    --muted: #71717a;
+    --accent: #3b82f6;
+    --accent-dark: #2563eb;
+  }
+
+  *{ box-sizing: border-box; }
+
+  html, body{
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+    overflow: hidden;
+  }
+
+  body{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .stage{
+    position: relative;
+    width: 100%;
+    max-width: 720px;
+    padding: 40px 32px;
+  }
+
+  .kicker{
+    font-size: 13px;
+    color: var(--muted);
+    margin: 0 0 6px 0;
+    letter-spacing: 0.02em;
+  }
+
+  h1{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: clamp(28px, 5vw, 42px);
+    line-height: 1.1;
+    margin: 0 0 8px 0;
+    max-width: 11ch;
+  }
+
+  .subtitle{
+    font-size: 14px;
+    color: var(--muted);
+    margin: 0 0 40px 0;
+  }
+
+  .route{
+    position: relative;
+    width: 100%;
+    height: 230px;
+  }
+
+  .route svg{
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+  }
+
+  .route-path{
+    fill: none;
+    stroke: var(--line);
+    stroke-width: 6;
+    stroke-linecap: round;
+  }
+
+  .route-path-fill{
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 6;
+    stroke-linecap: round;
+    stroke-dasharray: 620;
+    stroke-dashoffset: 620;
+    animation: draw 1.4s ease-out forwards 0.15s;
+  }
+
+  @keyframes draw{
+    to{ stroke-dashoffset: 0; }
+  }
+
+  .stop{
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    display: block;
+  }
+
+  .stop-dot{
+    fill: var(--bg);
+    stroke: var(--accent);
+    stroke-width: 5;
+    transition: stroke 0.15s, fill 0.15s, r 0.15s;
+  }
+
+  .stop:hover .stop-dot,
+  .stop:focus-visible .stop-dot{
+    fill: var(--accent);
+    r: 12;
+  }
+
+  .stop-label{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 600;
+    font-size: 20px;
+    fill: var(--text);
+  }
+
+  .stop-sub{
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    fill: var(--muted);
+  }
+
+  .stop:hover .stop-label,
+  .stop:focus-visible .stop-label{
+    fill: var(--accent);
+  }
+
+  .stop:focus-visible .stop-dot{
+    outline: none;
+    filter: drop-shadow(0 0 0 3px var(--accent-dark));
+  }
+
+  .footnote{
+    margin-top: 34px;
+    font-size: 12px;
+    color: var(--muted);
+    max-width: 42ch;
+    line-height: 1.5;
+  }
+</style>
 </head>
 <body>
 
-    <div id="toolbar">
-        <div class="tool-group">
-            <button id="btn-select" class="active" data-mode="select">Pointer / Edit</button>
-            <button id="btn-track" data-mode="track">Add Track</button>
-            <button id="btn-split" data-mode="split">Split Track</button>
-            <button id="btn-platform" data-mode="platform">Add Platform</button>
-            <button id="btn-signal" data-mode="signal">Add Signal</button>
-            <button id="btn-label" data-mode="label">Add Text Label</button>
-            <button id="btn-delete" data-mode="delete">Delete Mode</button>
-        </div>
-        <div class="tool-group">
-            <button id="btn-overpass" disabled>Toggle Overpass</button>
-            <button id="btn-edit-track" disabled>Edit Track Info</button>
-            <button id="btn-edit-platform" disabled>Edit Platform Info</button>
-            <button id="btn-edit-label" disabled>Edit Label Text</button>
-            <label for="elem-color" style="margin-left: 5px;">Color:</label>
-            <input type="color" id="elem-color" value="#e4e4e7">
-        </div>
-        <div class="tool-group">
-            <button id="btn-toggle-signal" disabled>Toggle Signal (Red/Blue)</button>
-            <button id="btn-flip-signal" disabled>Flip Signal Direction</button>
-        </div>
-        <div class="tool-group">
-            <label for="grid-size">Grid Size:</label>
-            <input type="range" id="grid-size" min="20" max="100" value="40">
-            <span id="grid-val">40</span>
-            <button id="btn-toggle-diagonal-grid">Diagonal Grid: Off</button>
-        </div>
-        <div class="tool-group">
-            <button id="btn-export">Export</button>
-            <button id="btn-import-trigger">Import</button>
-            <input type="file" id="import-file" style="display: none;" accept=".json">
-        </div>
+  <div class="stage">
+    <p class="kicker">Line 1 &middot; Terminus to Terminus</p>
+    <h1>TrainSig</h1>
+    <p class="subtitle">A transit line diagram creator &amp; signalling sim</p>
+
+    <div class="route">
+      <svg viewBox="0 0 620 230" preserveAspectRatio="xMinYMid meet">
+        <path class="route-path" d="M 40 200 C 160 200, 160 40, 310 40 C 460 40, 460 200, 580 200" />
+        <path class="route-path-fill" d="M 40 200 C 160 200, 160 40, 310 40 C 460 40, 460 200, 580 200" />
+
+        <a class="stop" tabindex="-1" href="#play" id="link-play">
+          <circle class="stop-dot" cx="40" cy="200" r="9" />
+          <text class="stop-label" x="40" y="228" text-anchor="middle">Play</text>
+          <text class="stop-sub" x="40" y="176" text-anchor="middle">run the network</text>
+        </a>
+
+        <a class="stop" tabindex="-1" href="/builder" id="link-build">
+          <circle class="stop-dot" cx="580" cy="200" r="9" />
+          <text class="stop-label" x="580" y="228" text-anchor="middle">Build</text>
+          <text class="stop-sub" x="580" y="176" text-anchor="middle">open editor</text>
+        </a>
+      </svg>
     </div>
 
-    <div id="canvas-container">
-        <canvas id="canvas"></canvas>
-        <div class="hint">Right-click + drag to Pan | Scroll to Zoom | Drag a signal's circle to reposition it - the post leaves the track perpendicular, then routes to the head in clean 45°-ish legs | Signals are directional: the arrow shows which travel direction sees the light</div>
-    </div>
+    <p class="footnote">
+      Build draws the network. Play imports what you've built and runs it
+      live &mdash; work the signals, and control the clock with pause and
+      1x&ndash;60x time warp.
+    </p>
+  </div>
 
-    <div id="edit-modal-overlay" class="modal-overlay hidden">
-        <div class="modal-box">
-            <h3 id="modal-title">Edit</h3>
-            <div id="modal-fields"></div>
-            <div class="modal-actions">
-                <button id="modal-cancel">Cancel</button>
-                <button id="modal-save">Save</button>
-            </div>
-        </div>
-    </div>
+  <script>
+    function goToBuilder(){
+      window.location.href = '/builder';
+    }
+    function goToPlay(){
+      window.location.href = '/game';
+    }
+    document.getElementById('link-play').addEventListener('click', function(e){
+      e.preventDefault();
+      goToPlay();
+    });
+    document.getElementById('link-build').addEventListener('click', function(e){
+      e.preventDefault();
+      goToBuilder();
+    });
+  </script>
 
-    <script src="script.js"></script>
 </body>
 </html>
