@@ -961,37 +961,30 @@
   </div>
 
   <!--
-    Trystero: WebRTC peer-to-peer networking with no backend to run or pay
-    for. Peer discovery ("signaling") piggybacks on free public MQTT
-    brokers (EMQX, HiveMQ, Mosquitto, Eclipse); once two browsers find
+    PeerJS: WebRTC peer-to-peer networking with no backend to run or pay
+    for. Peer discovery ("signaling") uses PeerJS Cloud, the free hosted
+    signaling server PeerJS ships with by default; once two browsers find
     each other this way, all game traffic flows directly over a WebRTC
-    data channel, not through this or any other server - so switching
-    strategies here has no effect on in-game latency or tick rate.
-    (We deliberately use the MQTT strategy rather than BitTorrent -
-    BitTorrent tracker hostnames all contain the word "tracker", which
-    many ad-blocking/privacy browser extensions block outright regardless
-    of which specific tracker it is - and MQTT proved more reliable in
-    practice than Nostr, whose public relays turned out to be a moving
-    target: one went paid-only, another had recurring outages.) Pinned to
-    a known-stable version/API (0.19.0's deep-import 'mqtt' strategy)
-    since Trystero has made breaking API changes across recent releases -
-    bump this deliberately, not blindly, and if you do, re-check every
-    onPeerJoin/onPeerLeave/relayUrls call site in net.js since the config
-    shape and event-registration style both changed in newer versions.
-    Trystero itself only ships as an ES module, so it's loaded here and
-    handed off to net.js (a plain classic script) via window.trystero.
+    data channel, not through this or any other server - so signaling
+    reliability has no effect on in-game latency or tick rate once
+    connected. We switched to this from Trystero (WebRTC over public MQTT
+    brokers) after repeatedly losing signaling reliability as those
+    brokers changed hands or went flaky - PeerJS's own signaling service
+    is purpose-built rather than a repurposed IoT test broker.
+    PeerJS ships a UMD build, so a plain classic <script> tag is enough -
+    it attaches a global `Peer` constructor that net.js uses directly
+    (`new Peer(id)` to host, `new Peer()` then `.connect(hostId)` to join).
+    Pinned to a specific version; if you bump it, re-check every
+    peer.on(...)/conn.on(...) call site in net.js in case the event/config
+    shape has changed.
   -->
-  <script type="module">
-    import { joinRoom, selfId } from 'https://esm.run/trystero@0.19.0/mqtt';
-    window.trystero = { joinRoom, selfId };
-    window.dispatchEvent(new Event('trystero-ready'));
-  </script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <!-- Cache-busting version query on these two: GitHub Pages / browsers can
        hold onto old cached copies of plain .js files for a while, and a
        normal reload doesn't always re-fetch them. Bump this whenever you
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
-  <script src="game.js?v=5"></script>
-  <script src="net.js?v=5"></script>
+  <script src="game.js?v=6"></script>
+  <script src="net.js?v=6"></script>
 </body>
 </html>
