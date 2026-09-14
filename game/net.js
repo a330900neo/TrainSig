@@ -2,22 +2,12 @@
  * net.js - Multiplayer layer for TrainSig.
  *
  * SERVERLESS*, FREE, LOW-LATENCY:
- * All game traffic (state snapshots, inputs, ping) flows directly
- * peer-to-peer over WebRTC data channels via PeerJS
- * (https://peerjs.com). PeerJS only touches a signaling server to let
- * two browsers find each other and exchange WebRTC connection info -
- * once that handshake completes, the signaling server is no longer
- * involved and all traffic is a direct browser-to-browser data channel.
- * (*We use PeerJS Cloud, the free hosted broker PeerJS ships with by
- * default - we don't run or pay for anything. See MP_ICE_SERVERS below
- * for the STUN/TURN NAT-traversal config, which is separate from
- * signaling.)
+ * All game traffic flows directly over a WebRTC data channel. The offer and
+ * answer are copied between browsers once during setup, so this needs no
+ * signaling server and works from a static GitHub Pages site.
  *
- * We previously used Trystero (WebRTC over public MQTT brokers for
- * signaling) but kept losing signaling reliability as those brokers
- * changed hands or went flaky. PeerJS's own signaling server is a
- * purpose-built, dedicated service rather than a repurposed IoT test
- * broker, which has been more consistent in practice.
+ * The host-authoritative game protocol below is unchanged; only the transport
+ * setup is deliberately small and limited to one LAN guest.
  *
  * AUTHORITY MODEL:
  * Host-authoritative. The host is the only machine that runs the real
@@ -36,7 +26,7 @@
  * DataConnection directly to the host's Peer ID. Clients never connect
  * to each other - there is no other WebRTC link to accidentally rely on.
  *
- * This file is a plain classns (non-module) script loaded after game.js,
+ * This file is a plain classic (non-module) script loaded after game.js,
  * so it shares game.js's top-level scope directly: `state`, `trains`,
  * `simSpeed`, `simPaused`, `simTimeSeconds`, `gameOver`, `selectedTrainId`,
  * and functions like `loadDiagram`, `spawnTrainAt`, `despawnTrain`,
@@ -45,42 +35,15 @@
  * are all just... there. No imports needed.
  */
 
-const MP_APP_ID = 'trainsig-v1';
 const TIME_WARP_MIN = 1;
 const TIME_WARP_MAX = 60;
 const SNAPSHOT_HZ = 15;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
 const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
 
-// PeerJS peer IDs live in one flat global namespace on the public broker,
-// so we prefix ours with our app ID to avoid colliding with some other
-// PeerJS app's IDs. A room's host is always reachable at
-// `${MP_APP_ID}-${roomCode}` - clients only ever need the room code
-// (shown to the player) to derive this and connect directly.
-function mpHostPeerId(roomCode) {
-    return MP_APP_ID + '-' + roomCode;
-}
-
-// STUN handles NAT traversal for the common case; the Open Relay Project's
-// free TURN tier is a fallback for players behind stricter (symmetric /
-// carrier-grade / corporate) NATs where a direct path can't be found.
-// This is passed to `new Peer(id, { config: { iceServers } })` - it's
-// independent of signaling (which PeerJS Cloud handles) and only affects
-// the actual WebRTC media/data path.
-const MP_ICE_SERVERS = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
-];
-
-function mpRandomRoomCode() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I - easy to read aloud
-    let s = '';
-    for (let i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)];
-    return s;
-}
+// No hosted signaling or relay is used: host candidates are enough for
+// browsers on the same local network.
+const MP_ICE_SERVERS = [];
 
 function mpDefaultPermissions() {
     return {
@@ -157,13 +120,11 @@ const MP = {
     hostRoom(username, opts) {
         if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
 
-        this._whenReady(() => {
-            this.username = username;
-            this.isHost = true;
-            this.roomSettings.limit = (opts.limit && opts.limit > 0) ? opts.limit : null;
-            this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
-            this._hostOpen(3); // a handful of retries in case a room code's ID is somehow taken
-        });
+        this.username = username;
+        this.isHost = true;
+        this.roomSettings.limit = 1;
+        this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
+        this._hostOpen();
     },
 
     // Tries to claim a fresh room code as our PeerJS ID. Collisions are rare
@@ -638,6 +599,132 @@ const MP = {
 };
 window.MP = MP;
 
+// Static-site multiplayer transport. Signaling is intentionally manual:
+// players exchange one offer and one answer, then all game data is direct.
+function mpWaitForIce(peer) {
+    if (peer.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise(resolve => {
+        let done = () => {
+            if (peer.iceGatheringState === 'complete') {
+                peer.removeEventListener('icegatheringstatechange', done);
+                resolve();
+            }
+        };
+        peer.addEventListener('icegatheringstatechange', done);
+        setTimeout(() => {
+            peer.removeEventListener('icegatheringstatechange', done);
+            resolve();
+        }, 5000);
+    });
+}
+
+MP._wireChannel = function (channel, peerId) {
+    channel.onmessage = event => {
+        let data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+        this._onMessage(data, peerId);
+    };
+    channel.onclose = () => this._onPeerLeave(peerId);
+    channel.onerror = event => console.error('WebRTC data channel error:', event);
+};
+
+MP._hostOnConnection = function (channel, peerId) {
+    let id = peerId || 'guest';
+    this.conns[id] = channel;
+    this._wireChannel(channel, id);
+    channel.onopen = () => {
+        if (this.active) showToast('Player connected. You can start the game.');
+    };
+};
+
+MP._clientOnConnection = function (channel) {
+    this.hostConn = channel;
+    this._wireChannel(channel, 'host');
+    channel.onopen = () => {
+        this.active = true;
+        this._send({ type: 'JOIN_REQUEST', username: this.username });
+    };
+};
+
+MP._send = function (data, target) {
+    if (this.isHost) {
+        if (target) {
+            let channel = this.conns[target];
+            if (channel && channel.readyState === 'open') channel.send(JSON.stringify(data));
+        } else {
+            Object.values(this.conns).forEach(channel => {
+                if (channel.readyState === 'open') channel.send(JSON.stringify(data));
+            });
+        }
+    } else if (this.hostConn && this.hostConn.readyState === 'open') {
+        this.hostConn.send(JSON.stringify(data));
+    }
+};
+
+MP.hostRoom = async function (username, opts) {
+    if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
+    try {
+        this.username = username;
+        this.isHost = true;
+        this.roomSettings.limit = 1;
+        this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
+        this.peer = new RTCPeerConnection({ iceServers: MP_ICE_SERVERS });
+        this.selfId = 'host';
+        this._hostOnConnection(this.peer.createDataChannel('trainsig', { ordered: true }), 'guest');
+        await this.peer.setLocalDescription(await this.peer.createOffer());
+        await mpWaitForIce(this.peer);
+        document.getElementById('mp-host-offer').value = JSON.stringify(this.peer.localDescription);
+        document.getElementById('mp-host-signaling').classList.remove('hidden');
+        this.active = true;
+        this.players[this.selfId] = {
+            peerId: this.selfId, username: this.username, permissions: mpDefaultPermissions(),
+            pingMs: 0, status: 'ready', isHost: true
+        };
+        UI.showLobby(true);
+        this._broadcastPlayerList();
+    } catch (err) {
+        console.error('WebRTC host setup error:', err);
+        showToast("Couldn't create a LAN room. Use a modern browser and try again.");
+    }
+};
+
+MP.joinRoom = async function (offerText, username) {
+    try {
+        this.username = username;
+        this.isHost = false;
+        this.selfId = 'guest-' + Math.random().toString(36).slice(2, 8);
+        this.peer = new RTCPeerConnection({ iceServers: MP_ICE_SERVERS });
+        this.peer.ondatachannel = event => this._clientOnConnection(event.channel);
+        await this.peer.setRemoteDescription(JSON.parse((offerText || '').trim()));
+        await this.peer.setLocalDescription(await this.peer.createAnswer());
+        await mpWaitForIce(this.peer);
+        document.getElementById('mp-join-answer').value = JSON.stringify(this.peer.localDescription);
+        document.getElementById('mp-join-signaling').classList.remove('hidden');
+        document.body.classList.add('mp-client-mode');
+        UI.showLobby(false);
+        UI.setLobbyWaitingText('Send the answer to the host. Waiting for connection\u2026');
+    } catch (err) {
+        console.error('WebRTC join setup error:', err);
+        showToast('That offer is invalid or could not be opened.');
+    }
+};
+
+MP.connectHost = async function (answerText) {
+    if (!this.isHost || !this.peer) return;
+    try {
+        await this.peer.setRemoteDescription(JSON.parse((answerText || '').trim()));
+        showToast('Answer accepted. Waiting for the player to connect\u2026');
+    } catch (err) {
+        console.error('WebRTC answer error:', err);
+        showToast('That answer is invalid. Paste the complete answer and try again.');
+    }
+};
+
+MP.leaveRoom = function () {
+    this.active = false;
+    if (this.peer) this.peer.close();
+    window.location.href = window.location.pathname;
+};
+
 // ============================================================
 // --- UI: menu / lobby / in-game HUD ---
 // ============================================================
@@ -843,17 +930,16 @@ window.addEventListener('diagram-loaded', () => UI.updateHostSetupMapStatus());
 document.getElementById('mp-hostsetup-go').addEventListener('click', () => {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
     UI.goUsername(() => {
-        let limit = parseInt(document.getElementById('mp-host-limit').value, 10);
         let allowMidJoin = document.getElementById('mp-host-midjoin').checked;
-        MP.hostRoom(UI._pendingUsername, { limit: isFinite(limit) ? limit : null, allowMidGameJoin: allowMidJoin });
+        MP.hostRoom(UI._pendingUsername, { allowMidGameJoin: allowMidJoin });
     });
 });
 
 document.getElementById('mp-btn-join').addEventListener('click', () => UI.show('mp-screen-join'));
 document.getElementById('mp-join-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
 document.getElementById('mp-join-go').addEventListener('click', () => {
-    let code = document.getElementById('mp-join-code').value;
-    UI.goUsername(() => MP.joinRoom(code, UI._pendingUsername));
+    let offer = document.getElementById('mp-join-offer').value;
+    UI.goUsername(() => MP.joinRoom(offer, UI._pendingUsername));
 });
 
 document.getElementById('mp-username-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
@@ -866,26 +952,26 @@ document.getElementById('mp-username-next').addEventListener('click', () => {
 
 document.getElementById('mp-lobby-start').addEventListener('click', () => MP.startGame());
 document.getElementById('mp-lobby-leave').addEventListener('click', () => MP.leaveRoom());
-document.getElementById('mp-lobby-copy').addEventListener('click', () => {
-    let url = window.location.origin + window.location.pathname + '?room=' + MP.roomCode;
-    navigator.clipboard.writeText(url).then(
-        () => showToast('Invite link copied.'),
-        () => showToast('Room code: ' + MP.roomCode)
-    );
+document.getElementById('mp-host-connect').addEventListener('click', () => {
+    MP.connectHost(document.getElementById('mp-host-answer').value);
+});
+document.getElementById('mp-host-copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(document.getElementById('mp-host-offer').value)
+        .then(() => showToast('Offer copied.'))
+        .catch(() => showToast('Copy failed. Select and copy the offer manually.'));
+});
+document.getElementById('mp-join-copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(document.getElementById('mp-join-answer').value)
+        .then(() => showToast('Answer copied.'))
+        .catch(() => showToast('Copy failed. Select and copy the answer manually.'));
 });
 
 document.getElementById('mp-hud-toggle').addEventListener('click', () => {
     document.getElementById('mp-hud-list').classList.toggle('open');
 });
 
-// ---- Boot: if a room code is in the URL (?room=CODE), skip straight to
-// the username screen pre-wired to join it. Otherwise show the main menu.
+// ---- Boot: static hosting has no room URLs; the host and guest exchange
+// WebRTC descriptions manually so GitHub Pages needs no backend.
 (function mpBoot() {
-    let params = new URLSearchParams(window.location.search);
-    let roomFromLink = params.get('room');
-    if (roomFromLink) {
-        UI.goUsername(() => MP.joinRoom(roomFromLink, UI._pendingUsername));
-    } else {
-        UI.show('mp-screen-main');
-    }
+    UI.show('mp-screen-main');
 })();

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>TrainSig</title>
-<link rel="icon" type="image/png" href="./icon.png">
+<link rel="icon" type="image/png" href="../icon.png">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
 
@@ -618,6 +618,27 @@
     letter-spacing: 0.12em;
     color: var(--text);
   }
+  .mp-signal{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .mp-signal label{
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .mp-signal textarea{
+    width: 100%;
+    min-height: 72px;
+    resize: vertical;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    color: var(--text);
+    font: 11px/1.35 monospace;
+    padding: 8px;
+  }
 
   .mp-player-list{
     display: flex;
@@ -754,7 +775,7 @@
 
   <div class="topbar">
     <div class="brand">
-      <img src="./icon.png" alt="">
+      <img src="../icon.png" alt="">
       <span>TrainSig</span>
     </div>
     <div class="actions">
@@ -823,7 +844,7 @@
 
     <div class="mp-card hidden" id="mp-screen-mpmenu">
       <h1>Multiplayer</h1>
-      <p>Host a new room, or join one with a code.</p>
+      <p>Host a local LAN game, or join one using a copied connection offer.</p>
       <button class="btn btn-primary btn-full" id="mp-btn-host">Host Room</button>
       <button class="btn btn-full" id="mp-btn-join">Join Room</button>
       <button class="btn" id="mp-mpmenu-back">Back</button>
@@ -836,8 +857,7 @@
         <span id="mp-hostsetup-mapstatus">No diagram loaded yet.</span>
         <button class="btn btn-sm" id="mp-hostsetup-import">Import Diagram</button>
       </div>
-      <label class="mp-field-label">Player limit</label>
-      <input class="panel-input" type="number" min="1" id="mp-host-limit" placeholder="No limit">
+      <p class="mp-hint">One other player can join directly over your local network.</p>
       <label class="mp-check"><input type="checkbox" id="mp-host-midjoin" checked> Allow players to join mid-game</label>
       <div class="btn-row">
         <button class="btn" id="mp-hostsetup-back">Back</button>
@@ -847,7 +867,11 @@
 
     <div class="mp-card hidden" id="mp-screen-join">
       <h1>Join a room</h1>
-      <input class="panel-input" id="mp-join-code" placeholder="Room code" maxlength="8" style="text-transform:uppercase;letter-spacing:0.1em;">
+      <p>Ask the host to send their connection offer, then paste it below.</p>
+      <div class="mp-signal">
+        <label for="mp-join-offer">Host offer</label>
+        <textarea id="mp-join-offer" placeholder="Paste the host offer here"></textarea>
+      </div>
       <div class="btn-row">
         <button class="btn" id="mp-join-back">Back</button>
         <button class="btn btn-primary" id="mp-join-go">Join</button>
@@ -857,9 +881,20 @@
     <div class="mp-card mp-card-wide hidden" id="mp-screen-lobby">
       <h1 id="mp-lobby-title">Lobby</h1>
       <div class="mp-roomcode-row hidden" id="mp-lobby-roomcode-row">
-        <span>Room code:</span>
-        <span class="mp-roomcode" id="mp-lobby-roomcode"></span>
-        <button class="btn btn-sm" id="mp-lobby-copy">Copy invite link</button>
+        <span>Direct LAN connection</span>
+      </div>
+      <div class="mp-signal hidden" id="mp-host-signaling">
+        <label for="mp-host-offer">1. Send this offer to the other player</label>
+        <textarea id="mp-host-offer" readonly></textarea>
+        <button class="btn btn-sm" id="mp-host-copy">Copy offer</button>
+        <label for="mp-host-answer">2. Paste their answer here</label>
+        <textarea id="mp-host-answer" placeholder="Paste the answer here"></textarea>
+        <button class="btn btn-primary btn-full" id="mp-host-connect">Connect player</button>
+      </div>
+      <div class="mp-signal hidden" id="mp-join-signaling">
+        <label for="mp-join-answer">Send this answer back to the host</label>
+        <textarea id="mp-join-answer" readonly></textarea>
+        <button class="btn btn-sm" id="mp-join-copy">Copy answer</button>
       </div>
       <div class="mp-player-list" id="mp-lobby-players"></div>
       <div id="mp-lobby-hostcontrols" class="hidden">
@@ -960,31 +995,12 @@
     </div>
   </div>
 
-  <!--
-    PeerJS: WebRTC peer-to-peer networking with no backend to run or pay
-    for. Peer discovery ("signaling") uses PeerJS Cloud, the free hosted
-    signaling server PeerJS ships with by default; once two browsers find
-    each other this way, all game traffic flows directly over a WebRTC
-    data channel, not through this or any other server - so signaling
-    reliability has no effect on in-game latency or tick rate once
-    connected. We switched to this from Trystero (WebRTC over public MQTT
-    brokers) after repeatedly losing signaling reliability as those
-    brokers changed hands or went flaky - PeerJS's own signaling service
-    is purpose-built rather than a repurposed IoT test broker.
-    PeerJS ships a UMD build, so a plain classic <script> tag is enough -
-    it attaches a global `Peer` constructor that net.js uses directly
-    (`new Peer(id)` to host, `new Peer()` then `.connect(hostId)` to join).
-    Pinned to a specific version; if you bump it, re-check every
-    peer.on(...)/conn.on(...) call site in net.js in case the event/config
-    shape has changed.
-  -->
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <!-- Cache-busting version query on these two: GitHub Pages / browsers can
        hold onto old cached copies of plain .js files for a while, and a
        normal reload doesn't always re-fetch them. Bump this whenever you
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
-  <script src="game.js?v=6"></script>
-  <script src="net.js?v=6"></script>
+  <script src="game.js?v=7"></script>
+  <script src="net.js?v=7"></script>
 </body>
 </html>
