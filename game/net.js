@@ -135,7 +135,7 @@ const MP = {
 
         this.username = username;
         this.isHost = true;
-        this.roomSettings.limit = 1;
+        this.roomSettings.limit = null; // unlimited players
         this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
         this._hostOpen();
     },
@@ -692,7 +692,7 @@ MP.hostRoom = async function (username, opts) {
     try {
         this.username = username;
         this.isHost = true;
-        this.roomSettings.limit = 1;
+        this.roomSettings.limit = null; // unlimited players
         this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
         this.peer = new RTCPeerConnection({ iceServers: MP_ICE_SERVERS });
         this.selfId = 'host';
@@ -748,7 +748,7 @@ MP.connectHost = async function (answerText) {
 
 MP.leaveRoom = function () {
     this.active = false;
-    if (this.peer) this.peer.close();
+    if (this.peer) this.peer.destroy();
     window.location.href = window.location.pathname;
 };
 
@@ -758,7 +758,7 @@ MP.hostRoom = function (username, opts) {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
     this.username = username;
     this.isHost = true;
-    this.roomSettings.limit = 1;
+    this.roomSettings.limit = null; // unlimited players
     this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
     this._hostOpen(3);
 };
@@ -1028,7 +1028,7 @@ window.addEventListener('diagram-loaded', () => UI.updateHostSetupMapStatus());
 document.getElementById('mp-hostsetup-go').addEventListener('click', () => {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
     UI.goUsername(() => {
-        MP.hostRoom(UI._pendingUsername, { limit: 1, allowMidGameJoin: true });
+        MP.hostRoom(UI._pendingUsername, { allowMidGameJoin: true });
     });
 });
 
