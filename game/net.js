@@ -58,11 +58,20 @@ const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
 // strategy for redundancy (hundreds of independent public relays exist).
 // See index.html's <script type="module"> for the matching import
 // ('trystero@x/nostr').
+//
+// NOTE: nostr.wine used to be a free public relay but now requires a paid
+// subscription just to write events ("restricted: sign up at nostr.wine"
+// on every attempt), so it's useless here and has been dropped. Public
+// relays occasionally go down entirely too (relay.damus.io has returned
+// Cloudflare 521s during outages) - keep this list at 4-5 entries so
+// there's always enough overlap between host and client for signaling to
+// succeed even if one or two relays are having a bad day.
 const MP_RELAY_URLS = [
     'wss://relay.damus.io',
     'wss://nos.lol',
     'wss://relay.nostr.band',
-    'wss://nostr.wine'
+    'wss://nostr.mom',
+    'wss://relay.primal.net'
 ];
 
 // STUN handles NAT traversal for the common case; the Open Relay Project's
