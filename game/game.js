@@ -109,6 +109,7 @@ let manualRouteArmedTrainId = null; // train awaiting a map click for a manual d
 let manualRoutePreview = null; // { points, target, valid } - live route preview under the cursor while armed, recomputed every pointermove
 let gameOver = false;
 let crashAnim = null; // active crash camera/tilt animation - see triggerGameOver() and draw()
+let crashEventId = 0;
 
 // Theme (matches Builder) - camera
 let camera = { x: 0, y: 0, zoom: 1 };
@@ -659,13 +660,15 @@ function pickSpawnDirection(track) {
     return p2Deg >= p1Deg; // true = forward (p1->p2)
 }
 
-function spawnTrainAt(track) {
+function spawnTrainAt(track, options) {
     // Multiplayer: only the host actually mutates simulation state. A
     // non-host client just asks the host to do this and waits for the
     // resulting train to show up in the next state snapshot.
     if (window.MP && MP.active && !MP.isHost) {
         if (!MP.can('depotSpawnDespawn')) { showToast("You don't have permission to spawn trains."); return; }
-        MP.sendInput({ type: 'SPAWN_TRAIN', trackId: track.id });
+        let requestId = 'spawn_' + Math.random().toString(36).slice(2);
+        MP.pendingSpawnRequestId = requestId;
+        MP.sendInput({ type: 'SPAWN_TRAIN', trackId: track.id, requestId: requestId });
         return;
     }
     let forward = pickSpawnDirection(track);
@@ -714,8 +717,11 @@ function spawnTrainAt(track) {
     };
     train._occ = getOccupiedEdges(train);
     trains.push(train);
+    if (options && options.requestId) train.spawnRequestId = options.requestId;
     showToast('Train ' + train.label + ' spawned.');
-    selectTrain(train.id);
+    // A remote player's spawn is authoritative, but it must not change the
+    // host's local selection or open the host's detail panel.
+    if (!options || options.select !== false) selectTrain(train.id);
     draw();
     return train;
 }
@@ -1432,6 +1438,11 @@ function updateManualRoutePreview(wx, wy) {
 }
 
 function setManualTarget(train, trackId, distM) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
+        MP.sendInput({ type: 'MANUAL_ROUTE', trainId: train.id, trackId, distM });
+        return;
+    }
     let route = computeTrainRoute(train, trackId, distM);
     if (!route) { showToast('No route to that point.'); return; }
     train.route = route.edges;
@@ -1477,6 +1488,11 @@ function flipTrainHeadingInPlace(train) {
 }
 
 function reverseTrain(train) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
+        MP.sendInput({ type: 'REVERSE_TRAIN', trainId: train.id });
+        return;
+    }
     if (train.speedMs > TRAIN_STOPPED_MS) { showToast('Train must be stopped to reverse.'); return; }
 
     // The player can now reverse anywhere, not just at a flagged turnback
@@ -1524,6 +1540,11 @@ function reverseTrain(train) {
 }
 
 function toggleEmergencyBrake(train) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
+        MP.sendInput({ type: 'TOGGLE_BRAKE', trainId: train.id });
+        return;
+    }
     train.emergencyBrake = !train.emergencyBrake;
     showToast(train.label + (train.emergencyBrake ? ': emergency brake applied.' : ': emergency brake released.'));
     if (!train.emergencyBrake && train.mode === 'idle' && train.lineId) {
@@ -1533,6 +1554,11 @@ function toggleEmergencyBrake(train) {
 }
 
 function setTrainSpeedCap(train, kmh) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
+        MP.sendInput({ type: 'SET_SPEED_CAP', trainId: train.id, speedCapKmh: kmh });
+        return;
+    }
     train.speedCapKmh = (kmh == null || isNaN(kmh) || kmh < 0) ? null : kmh;
 }
 
@@ -1878,6 +1904,40 @@ function handleStopArrival(train, stop) {
 // --- Collision detection ---
 // ============================================================
 
+function occupiedTrackIntersection(sa, sb) {
+    if (sa.trackId === sb.trackId) return null;
+    let ta = getTrack(sa.trackId);
+    let tb = getTrack(sb.trackId);
+    if (!ta || !tb) return null;
+    // Builder overpasses are drawn on a separate level. A crossing is only
+    // a collision when both tracks are on the ground level.
+    if (ta.overpass || tb.overpass) return null;
+    let a1 = getPoint(ta.p1_id), a2 = getPoint(ta.p2_id);
+    let b1 = getPoint(tb.p1_id), b2 = getPoint(tb.p2_id);
+    if (!a1 || !a2 || !b1 || !b2) return null;
+
+    let ax = a2.x - a1.x, ay = a2.y - a1.y;
+    let bx = b2.x - b1.x, by = b2.y - b1.y;
+    let denominator = ax * by - ay * bx;
+    if (Math.abs(denominator) < 1e-8) return null;
+
+    let dx = b1.x - a1.x, dy = b1.y - a1.y;
+    let u = (dx * by - dy * bx) / denominator;
+    let v = (dx * ay - dy * ax) / denominator;
+    // Endpoints are handled by the normal route/track occupancy check. This
+    // test is specifically for crossings through the middle of two tracks.
+    if (u <= 1e-6 || u >= 1 - 1e-6 || v <= 1e-6 || v >= 1 - 1e-6) return null;
+
+    let aMeters = u * trackMeters(ta);
+    let bMeters = v * trackMeters(tb);
+    if (aMeters < sa.startM - 1e-3 || aMeters > sa.endM + 1e-3 ||
+        bMeters < sb.startM - 1e-3 || bMeters > sb.endM + 1e-3) return null;
+    return {
+        x: a1.x + ax * u,
+        y: a1.y + ay * u
+    };
+}
+
 function checkCollisions() {
     for (let i = 0; i < trains.length; i++) {
         for (let j = i + 1; j < trains.length; j++) {
@@ -1885,9 +1945,16 @@ function checkCollisions() {
             if (!a._occ || !b._occ) continue;
             for (let sa of a._occ) {
                 for (let sb of b._occ) {
-                    if (sa.trackId !== sb.trackId) continue;
-                    if (sa.startM < sb.endM - 1e-3 && sb.startM < sa.endM - 1e-3) {
-                        triggerGameOver(a, b);
+                    if (sa.trackId === sb.trackId) {
+                        if (sa.startM < sb.endM - 1e-3 && sb.startM < sa.endM - 1e-3) {
+                            triggerGameOver(a, b);
+                            return true;
+                        }
+                        continue;
+                    }
+                    let crossing = occupiedTrackIntersection(sa, sb);
+                    if (crossing) {
+                        triggerGameOver(a, b, crossing);
                         return true;
                     }
                 }
@@ -1897,7 +1964,7 @@ function checkCollisions() {
     return false;
 }
 
-function triggerGameOver(a, b) {
+function triggerGameOver(a, b, collisionPoint) {
     gameOver = true;
     simPaused = true;
     setPaused(true);
@@ -1906,16 +1973,18 @@ function triggerGameOver(a, b) {
     // crash close-up - fall back to train a's head if for some reason no
     // exact overlap point is found (shouldn't normally happen, since
     // checkCollisions only calls this once it has found one).
-    let crashPt = null;
-    outer:
-    for (let sa of a._occ || []) {
-        for (let sb of b._occ || []) {
-            if (sa.trackId !== sb.trackId) continue;
-            if (sa.startM < sb.endM - 1e-3 && sb.startM < sa.endM - 1e-3) {
-                let t = getTrack(sa.trackId);
-                let midM = (Math.max(sa.startM, sb.startM) + Math.min(sa.endM, sb.endM)) / 2;
-                crashPt = pointAtMeters(t, midM);
-                break outer;
+    let crashPt = collisionPoint || null;
+    if (!crashPt) {
+        outer:
+        for (let sa of a._occ || []) {
+            for (let sb of b._occ || []) {
+                if (sa.trackId !== sb.trackId) continue;
+                if (sa.startM < sb.endM - 1e-3 && sb.startM < sa.endM - 1e-3) {
+                    let t = getTrack(sa.trackId);
+                    let midM = (Math.max(sa.startM, sb.startM) + Math.min(sa.endM, sb.endM)) / 2;
+                    crashPt = pointAtMeters(t, midM);
+                    break outer;
+                }
             }
         }
     }
@@ -1924,8 +1993,14 @@ function triggerGameOver(a, b) {
         crashPt = ht ? pointAtMeters(ht, a.headDist) : { x: -camera.x / camera.zoom, y: -camera.y / camera.zoom };
     }
 
+    startCrashAnimation(crashPt, 'Trains ' + a.label + ' and ' + b.label + ' collided. Service has been halted.');
+}
+
+function startCrashAnimation(crashPt, message, tiltRad, eventId) {
+    crashEventId = eventId == null ? crashEventId + 1 : eventId;
     let targetZoom = Math.min(3, Math.max(camera.zoom * 1.4, 1.8));
     crashAnim = {
+        point: crashPt,
         startMs: (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(),
         duration: 1100,
         fromCam: { x: camera.x, y: camera.y, zoom: camera.zoom },
@@ -1934,8 +2009,10 @@ function triggerGameOver(a, b) {
             y: window.innerHeight / 2 - crashPt.y * targetZoom,
             zoom: targetZoom
         },
-        tiltRad: (20 * Math.PI / 180) * (Math.random() < 0.5 ? -1 : 1),
-        message: 'Trains ' + a.label + ' and ' + b.label + ' collided. Service has been halted.',
+        tiltRad: tiltRad == null
+            ? (20 * Math.PI / 180) * (Math.random() < 0.5 ? -1 : 1)
+            : tiltRad,
+        message,
         overlayShown: false
     };
 }
@@ -1984,8 +2061,7 @@ function draw() {
             trainHoldTriggered = true;
             let heldTrain = trains.find(t => t.id === trainHoldTrainId);
             if (heldTrain && !heldTrain.emergencyBrake) {
-                heldTrain.emergencyBrake = true;
-                showToast(heldTrain.label + ': emergency brake applied (held).');
+                toggleEmergencyBrake(heldTrain);
                 if (selectedTrainId === heldTrain.id) updateTrainPanel();
             }
         }
@@ -2096,6 +2172,7 @@ function draw() {
     }
 
     // 3. Tracks (underpass first, overpass on top - same convention as Builder)
+    ctx.lineCap = 'round';
     for (let pass of [false, true]) {
         for (let t of state.tracks) {
             if (!!t.overpass !== pass) continue;
@@ -2114,6 +2191,7 @@ function draw() {
             ctx.stroke();
         }
     }
+    ctx.lineCap = 'butt';
 
     // 3b. Depot underlay - dashed amber highlight, same as Builder, so
     // depot track segments are obviously clickable for spawning.
@@ -3060,9 +3138,10 @@ function simTick(now) {
 }
 
 document.getElementById('btn-pause').addEventListener('click', () => {
-    // In multiplayer, only the host's clock actually runs - a non-host
-    // client's pause button would have nothing to control locally.
-    if (window.MP && MP.active && !MP.isHost) return;
+    if (window.MP && MP.active && !MP.isHost) {
+        MP.sendInput({ type: 'SET_PAUSED', value: !simPaused });
+        return;
+    }
     setPaused(!simPaused);
 });
 
@@ -3251,10 +3330,13 @@ document.getElementById('tp-line-select').addEventListener('change', (e) => {
     draw();
 });
 
-document.getElementById('tp-platform-select').addEventListener('change', (e) => {
-    let train = trains.find(t => t.id === selectedTrainId);
+function setTrainPlatform(train, platformId) {
     if (!train || !train.pendingStop) return;
-    let platformId = e.target.value;
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
+        MP.sendInput({ type: 'SET_PLATFORM', trainId: train.id, platformId });
+        return;
+    }
     let oldPlatformId = train.pendingPlatformId;
     train.platformOverrides[train.pendingStop.id] = platformId;
 
@@ -3296,6 +3378,12 @@ document.getElementById('tp-platform-select').addEventListener('change', (e) => 
 
     showToast('Platform changed - route updated.');
     draw();
+}
+
+document.getElementById('tp-platform-select').addEventListener('change', (e) => {
+    let train = trains.find(t => t.id === selectedTrainId);
+    setTrainPlatform(train, e.target.value);
+    updateTrainPanel();
 });
 
 document.getElementById('tp-speedcap-apply').addEventListener('click', () => {
@@ -3546,9 +3634,20 @@ function handleImportFile(file) {
 }
 
 const importInput = document.getElementById('import-file');
-document.getElementById('btn-import-trigger').addEventListener('click', () => importInput.click());
-document.getElementById('btn-import-empty').addEventListener('click', () => importInput.click());
+document.getElementById('btn-import-trigger').addEventListener('click', () => {
+    if (window.MP && MP.active) { showToast('Map import is disabled during multiplayer.'); return; }
+    importInput.click();
+});
+document.getElementById('btn-import-empty').addEventListener('click', () => {
+    if (window.MP && MP.active) { showToast('Map import is disabled during multiplayer.'); return; }
+    importInput.click();
+});
 importInput.addEventListener('change', (e) => {
+    if (window.MP && MP.active) {
+        importInput.value = '';
+        showToast('Map import is disabled during multiplayer.');
+        return;
+    }
     handleImportFile(e.target.files[0]);
     importInput.value = '';
 });

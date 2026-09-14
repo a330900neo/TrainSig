@@ -759,12 +759,24 @@
   }
   .mp-hud-list.open{ display: block; }
 
-  .mp-client-mode #tp-brake,
-  .mp-client-mode #tp-reverse,
-  .mp-client-mode #tp-manual-route,
-  .mp-client-mode #ctx-brake,
-  .mp-client-mode #ctx-reverse,
-  .mp-client-mode #ctx-manual{
+  .mp-client-mode #tp-line-select,
+  .mp-client-mode #tp-platform-select,
+  .mp-client-mode #tp-speedcap,
+  .mp-client-mode #tp-speedcap-apply,
+  .mp-client-mode #tp-speedcap-clear{
+    opacity: 0.8;
+  }
+  .mp-client-mode #train-panel .panel-label::after{
+    content: ' (host controlled)';
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 400;
+  }
+  .mp-active #btn-import-trigger,
+  .mp-active #btn-import-empty{
+    display: none !important;
+  }
+  .mp-active #mp-hostsetup-import{
     display: none !important;
   }
 </style>
@@ -986,7 +998,7 @@
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="game.js?v=8"></script>
-  <script src="net.js?v=8"></script>
+  <script src="game.js?v=15"></script>
+  <script src="net.js?v=15"></script>
 </body>
 </html>

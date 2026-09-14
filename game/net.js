@@ -37,9 +37,9 @@
 
 const TIME_WARP_MIN = 1;
 const TIME_WARP_MAX = 60;
-const SNAPSHOT_HZ = 15;           // host -> clients state broadcast rate
+const SNAPSHOT_HZ = 30;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
-const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
+const CURSOR_INTERVAL_MS = 33;    // ~30Hz cursor position updates
 
 // No hosted signaling or relay is used: host candidates are enough for
 // browsers on the same local network.
@@ -98,10 +98,14 @@ const MP = {
     pingMs: null,                           // client-only: my RTT to the host
     playerListCache: [],                    // last known player list (both sides, for HUD rendering)
     remoteCursors: [],                      // [{peerId, username, x, y}] - other players' cursors, world coords
+    pendingSpawnRequestId: null,             // guest: train requested locally, awaiting host snapshot
 
     _lastSnapshotAt: 0,
+    _lastSnapshotReceivedAt: 0,
+    _snapshotBlendMs: 33,
     _lastPingAt: 0,
     _lastCursorAt: 0,
+    lastCrashEventId: 0,
 
     // ---------------- Permission helpers (used all over game.js) ----------------
 
@@ -164,6 +168,7 @@ const MP = {
             settled = true;
             this.selfId = id;
             this.active = true;
+            document.body.classList.add('mp-active');
 
             this.players[this.selfId] = {
                 peerId: this.selfId,
@@ -228,6 +233,7 @@ const MP = {
                 conn.on('open', () => {
                     connected = true;
                     this.active = true;
+                    document.body.classList.add('mp-active');
                     this._send({ type: 'JOIN_REQUEST', username: this.username });
                 });
                 conn.on('data', (data) => this._onMessage(data, hostId));
@@ -394,6 +400,9 @@ const MP = {
             case 'START_GAME': this._clientHandleStart(data); break;
             case 'STATE_SNAPSHOT': this.applySnapshot(data); break;
             case 'TIME_WARP_UPDATE': applyTimeWarpLocal(data.value); break;
+            case 'PAUSE_UPDATE':
+                setPaused(!!data.value);
+                break;
             case 'KICKED': showToast('You were removed from the room.'); this.leaveRoom(); break;
             case 'PING': this._send({ type: 'PONG', t: data.t }); break;
             case 'PONG': this._clientHandlePong(data); break;
@@ -454,7 +463,12 @@ const MP = {
             case 'SPAWN_TRAIN': {
                 if (!perms.depotSpawnDespawn) return;
                 let track = getTrack(cmd.trackId);
-                if (track) spawnTrainAt(track);
+                if (track) {
+                    let spawned = spawnTrainAt(track, { select: false, requestId: cmd.requestId });
+                    // A remote command must never leave the host's panel
+                    // pointing at the train just created for another player.
+                    if (spawned && selectedTrainId === spawned.id) closeTrainPanel();
+                }
                 break;
             }
             case 'DESPAWN_TRAIN': {
@@ -475,11 +489,46 @@ const MP = {
                 if (train) assignLineToTrain(train, cmd.lineId || null);
                 break;
             }
+            case 'SET_SPEED_CAP': {
+                if (!perms.lineAndSignalControl) return;
+                let train = trains.find(t => t.id === cmd.trainId);
+                if (train) setTrainSpeedCap(train, cmd.speedCapKmh);
+                break;
+            }
+            case 'TOGGLE_BRAKE': {
+                if (!perms.lineAndSignalControl) return;
+                let train = trains.find(t => t.id === cmd.trainId);
+                if (train) toggleEmergencyBrake(train);
+                break;
+            }
+            case 'REVERSE_TRAIN': {
+                if (!perms.lineAndSignalControl) return;
+                let train = trains.find(t => t.id === cmd.trainId);
+                if (train) reverseTrain(train);
+                break;
+            }
+            case 'SET_PLATFORM': {
+                if (!perms.lineAndSignalControl) return;
+                let train = trains.find(t => t.id === cmd.trainId);
+                if (train && train.pendingStop) setTrainPlatform(train, cmd.platformId);
+                break;
+            }
+            case 'MANUAL_ROUTE': {
+                if (!perms.lineAndSignalControl) return;
+                let train = trains.find(t => t.id === cmd.trainId);
+                if (train) setManualTarget(train, cmd.trackId, cmd.distM);
+                break;
+            }
             case 'SET_TIME_WARP': {
                 if (!perms.timeWarp || !perms.timeWarp.allowed) return;
                 let v = cmd.value;
                 if (typeof perms.timeWarp.capX === 'number') v = Math.min(v, perms.timeWarp.capX);
                 applyTimeWarpLocal(v); // host is authoritative; this broadcasts TIME_WARP_UPDATE itself
+                break;
+            }
+            case 'SET_PAUSED': {
+                setPaused(!!cmd.value);
+                this._send({ type: 'PAUSE_UPDATE', value: simPaused });
                 break;
             }
         }
@@ -510,6 +559,14 @@ const MP = {
             simTimeSeconds, simSpeed, simPaused, gameOver,
             trains: trains,
             signals: state.signals.map(s => ({ id: s.id, state: s.state })),
+            platforms: state.platforms.map(p => ({ id: p.id, waiting: p._waiting || {} })),
+            crash: crashAnim ? {
+                id: crashEventId,
+                x: crashAnim.point.x,
+                y: crashAnim.point.y,
+                message: crashAnim.message,
+                tiltRad: crashAnim.tiltRad
+            } : null,
             cursors
         };
     },
@@ -559,14 +616,64 @@ const MP = {
     },
 
     applySnapshot(data) {
+        let receivedAt = performance.now();
+        if (this._lastSnapshotReceivedAt) {
+            this._snapshotBlendMs = Math.max(20, Math.min(200, receivedAt - this._lastSnapshotReceivedAt));
+        }
+        this._lastSnapshotReceivedAt = receivedAt;
         simTimeSeconds = data.simTimeSeconds;
         simSpeed = data.simSpeed;
         simPaused = data.simPaused;
         gameOver = data.gameOver;
+        if (data.crash && data.crash.id !== this.lastCrashEventId) {
+            this.lastCrashEventId = data.crash.id;
+            gameOver = true;
+            simPaused = true;
+            setPaused(true);
+            startCrashAnimation(
+                { x: data.crash.x, y: data.crash.y },
+                data.crash.message,
+                data.crash.tiltRad,
+                data.crash.id
+            );
+        }
+        let previousTrainIds = new Set(trains.map(train => train.id));
+        let oldTrains = new Map(trains.map(train => [train.id, train]));
         trains = data.trains;
+        for (let train of trains) {
+            let old = oldTrains.get(train.id);
+            let sameTrackAndDirection = old &&
+                old.headTrackId === train.headTrackId &&
+                old.headForward === train.headForward;
+            train._renderHeadDist = sameTrackAndDirection
+                ? old.headDist
+                : train.headDist;
+            train._targetHeadDist = train.headDist;
+            train._interpolatePosition = !!sameTrackAndDirection;
+            train._interpolateFrom = train._renderHeadDist;
+            train._interpolateStartedAt = receivedAt;
+            train._interpolateDuration = this._snapshotBlendMs;
+        }
+        // Occupancy is derived render/hit-test state and must be rebuilt on
+        // guests after a JSON snapshot arrives.
+        for (let train of trains) train._occ = getOccupiedEdges(train);
+        if (this.pendingSpawnRequestId) {
+            let spawned = trains.find(train =>
+                !previousTrainIds.has(train.id) &&
+                train.spawnRequestId === this.pendingSpawnRequestId
+            );
+            if (spawned) {
+                this.pendingSpawnRequestId = null;
+                selectTrain(spawned.id);
+            }
+        }
         for (let s of data.signals) {
             let sig = state.signals.find(x => x.id === s.id);
             if (sig) sig.state = s.state;
+        }
+        for (let p of (data.platforms || [])) {
+            let platform = state.platforms.find(x => x.id === p.id);
+            if (platform) platform._waiting = p.waiting || {};
         }
         this.remoteCursors = data.cursors || [];
         updateClockDisplay();
@@ -596,6 +703,17 @@ const MP = {
     },
 
     clientTick(now) {
+        for (let train of trains) {
+            if (!train._interpolatePosition ||
+                typeof train._targetHeadDist !== 'number' ||
+                typeof train._interpolateStartedAt !== 'number') continue;
+            let progress = Math.min(1, Math.max(0,
+                (now - train._interpolateStartedAt) / train._interpolateDuration));
+            train._renderHeadDist = train._interpolateFrom +
+                (train._targetHeadDist - train._interpolateFrom) * progress;
+            train.headDist = train._renderHeadDist;
+            train._occ = getOccupiedEdges(train);
+        }
         if (now - this._lastPingAt >= PING_INTERVAL_MS) {
             this._lastPingAt = now;
             this._send({ type: 'PING', t: performance.now() });
@@ -1023,7 +1141,10 @@ document.getElementById('mp-btn-host').addEventListener('click', () => {
     UI.updateHostSetupMapStatus();
 });
 document.getElementById('mp-hostsetup-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
-document.getElementById('mp-hostsetup-import').addEventListener('click', () => importInput.click());
+document.getElementById('mp-hostsetup-import').addEventListener('click', () => {
+    if (MP.active) { showToast('Map import is disabled during multiplayer.'); return; }
+    importInput.click();
+});
 window.addEventListener('diagram-loaded', () => UI.updateHostSetupMapStatus());
 document.getElementById('mp-hostsetup-go').addEventListener('click', () => {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
