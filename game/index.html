@@ -962,21 +962,27 @@
 
   <!--
     Trystero: WebRTC peer-to-peer networking with no backend to run or pay
-    for. Peer discovery ("signaling") piggybacks on free public Nostr
-    relays; once two browsers find each other this way, all game traffic
-    flows directly over a WebRTC data channel, not through this or any
-    other server. (We deliberately use the Nostr strategy rather than
-    BitTorrent - BitTorrent tracker hostnames all contain the word
-    "tracker", which many ad-blocking/privacy browser extensions block
-    outright regardless of which specific tracker it is.) Pinned to a
-    known-stable version/API (0.19.0's deep-import 'nostr' strategy) since
-    Trystero has made breaking API changes across recent releases - bump
-    this deliberately, not blindly. Trystero itself only ships as an ES
-    module, so it's loaded here and handed off to net.js (a plain classic
-    script) via window.trystero.
+    for. Peer discovery ("signaling") piggybacks on free public MQTT
+    brokers (EMQX, HiveMQ, Mosquitto, Eclipse); once two browsers find
+    each other this way, all game traffic flows directly over a WebRTC
+    data channel, not through this or any other server - so switching
+    strategies here has no effect on in-game latency or tick rate.
+    (We deliberately use the MQTT strategy rather than BitTorrent -
+    BitTorrent tracker hostnames all contain the word "tracker", which
+    many ad-blocking/privacy browser extensions block outright regardless
+    of which specific tracker it is - and MQTT proved more reliable in
+    practice than Nostr, whose public relays turned out to be a moving
+    target: one went paid-only, another had recurring outages.) Pinned to
+    a known-stable version/API (0.19.0's deep-import 'mqtt' strategy)
+    since Trystero has made breaking API changes across recent releases -
+    bump this deliberately, not blindly, and if you do, re-check every
+    onPeerJoin/onPeerLeave/relayUrls call site in net.js since the config
+    shape and event-registration style both changed in newer versions.
+    Trystero itself only ships as an ES module, so it's loaded here and
+    handed off to net.js (a plain classic script) via window.trystero.
   -->
   <script type="module">
-    import { joinRoom, selfId } from 'https://esm.run/trystero@0.19.0/nostr';
+    import { joinRoom, selfId } from 'https://esm.run/trystero@0.19.0/mqtt';
     window.trystero = { joinRoom, selfId };
     window.dispatchEvent(new Event('trystero-ready'));
   </script>
@@ -985,7 +991,7 @@
        normal reload doesn't always re-fetch them. Bump this whenever you
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
-  <script src="game.js?v=4"></script>
-  <script src="net.js?v=4"></script>
+  <script src="game.js?v=5"></script>
+  <script src="net.js?v=5"></script>
 </body>
 </html>

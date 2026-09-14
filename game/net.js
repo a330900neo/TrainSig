@@ -5,11 +5,11 @@
  * All game traffic (state snapshots, inputs, ping) flows directly
  * peer-to-peer over WebRTC data channels via Trystero
  * (https://github.com/dmotz/trystero). Trystero only uses free public
- * Nostr relays to let two browsers find each other and exchange WebRTC
+ * MQTT brokers to let two browsers find each other and exchange WebRTC
  * connection info ("signaling") - once that handshake completes,
  * signaling is no longer involved. We run and pay for nothing.
- * (We use Trystero's Nostr strategy rather than its BitTorrent one - see
- * the comment above MP_RELAY_URLS below for why.)
+ * (We use Trystero's MQTT strategy - see the comment above MP_RELAY_URLS
+ * below for why, and why not Nostr or BitTorrent.)
  *
  * AUTHORITY MODEL:
  * Host-authoritative. The host is the only machine that runs the real
@@ -44,34 +44,33 @@ const SNAPSHOT_HZ = 15;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
 const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
 
-// Signaling relay list: we pin our own relays rather than trusting
-// Trystero's defaults, for two reasons learned the hard way:
-//   1. Some individual relays reject connections (403) from certain origins
-//      like GitHub Pages.
-//   2. Any hostname containing the word "tracker" - which is how every
+// Signaling broker list: we pin our own brokers rather than trusting
+// Trystero's defaults, for reasons learned the hard way:
+//   1. Any hostname containing the word "tracker" - which is how every
 //      BitTorrent tracker is named - gets silently blocked outright by many
-//      ad-blocking/privacy browser extensions (they filter on that keyword).
-//      That ruled out the BitTorrent strategy entirely for a chunk of
-//      players, not just a chunk of trackers.
-// Nostr sidesteps both: its relays are plain "relay.xxx"/"nos.lol"-style
-// names with no "tracker" in sight, and it's Trystero's own recommended
-// strategy for redundancy (hundreds of independent public relays exist).
+//      ad-blocking/privacy browser extensions. That rules out the
+//      BitTorrent strategy entirely for a chunk of players, not just a
+//      chunk of trackers.
+//   2. We *were* on Trystero's default (Nostr) strategy, but public Nostr
+//      relays turned out to be a moving target: nostr.wine quietly went
+//      from free to paid-subscription-only (every signaling attempt got
+//      rejected with "restricted: sign up..."), and relay.damus.io has
+//      intermittent Cloudflare 521 outages. Individually flaky relays are
+//      normal and tolerable with redundancy, but losing half the list to
+//      one relay going paid was not.
+// MQTT is Trystero's next-most-robust strategy after Nostr (per its own
+// docs) and piggybacks on long-running public IoT test brokers instead -
+// EMQX, HiveMQ, Mosquitto, and Eclipse's sandbox broker. These have been
+// free, unauthenticated, and stable for years (they exist specifically so
+// IoT developers have something to test against), and none of their
+// hostnames trip the "tracker" ad-blocker filter.
 // See index.html's <script type="module"> for the matching import
-// ('trystero@x/nostr').
-//
-// NOTE: nostr.wine used to be a free public relay but now requires a paid
-// subscription just to write events ("restricted: sign up at nostr.wine"
-// on every attempt), so it's useless here and has been dropped. Public
-// relays occasionally go down entirely too (relay.damus.io has returned
-// Cloudflare 521s during outages) - keep this list at 4-5 entries so
-// there's always enough overlap between host and client for signaling to
-// succeed even if one or two relays are having a bad day.
+// ('trystero@0.19.0/mqtt').
 const MP_RELAY_URLS = [
-    'wss://relay.damus.io',
-    'wss://nos.lol',
-    'wss://relay.nostr.band',
-    'wss://nostr.mom',
-    'wss://relay.primal.net'
+    'wss://broker.emqx.io:8084/mqtt',
+    'wss://broker.hivemq.com:8884/mqtt',
+    'wss://test.mosquitto.org:8081',
+    'wss://mqtt.eclipseprojects.io:443/mqtt'
 ];
 
 // STUN handles NAT traversal for the common case; the Open Relay Project's
@@ -285,9 +284,14 @@ const MP = {
 
     _openRoom(code) {
         try {
-            // Note: relayRedundancy is ignored by Trystero whenever relayUrls
-            // is also given - passing an explicit list means the whole list
-            // is used, which is exactly what we want here.
+            // Note: relayRedundancy is ignored by Trystero whenever
+            // relayUrls is also given - passing an explicit list means the
+            // whole list is used, which is exactly what we want here.
+            // (relayUrls/rtcConfig as top-level joinRoom keys is the
+            // 0.19.0 API we're pinned to - newer Trystero versions nest
+            // this under relayConfig instead, but mixing that shape in
+            // here while the rest of this file still uses 0.19.0's
+            // function-call style for onPeerJoin/onPeerLeave would break.)
             this.room = window.trystero.joinRoom({
                 appId: MP_APP_ID,
                 relayUrls: MP_RELAY_URLS,
