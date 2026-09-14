@@ -112,6 +112,10 @@ let crashAnim = null; // active crash camera/tilt animation - see triggerGameOve
 
 // Theme (matches Builder) - camera
 let camera = { x: 0, y: 0, zoom: 1 };
+// Multiplayer: this client's own cursor in world coordinates, updated on
+// every pointermove and periodically broadcast by net.js. null when the
+// pointer is outside the canvas (so we don't broadcast a stale position).
+let mpCursorWorld = null;
 let isPanning = false;
 let panPointerId = null;
 let panStart = { x: 0, y: 0 };
@@ -2366,8 +2370,66 @@ function draw() {
         ctx.fillText(l.text, l.x, l.y);
     }
 
+    // 8. Multiplayer: other players' cursors (drawn last so they float
+    // above everything else). Positions arrive in world coords via the
+    // network layer, so they draw correctly here even though each client
+    // may be panned/zoomed completely differently from one another.
+    if (typeof MP !== 'undefined' && MP.active) drawRemoteCursors();
+
     ctx.restore();
     camera = realCamera;
+}
+
+// Multiplayer: draws every other connected player's cursor as a small
+// colored pointer + username tag, positioned in world coordinates so it
+// lines up correctly under camera panning/zoom identically to everything
+// else on the map - even though each viewer's own camera may differ.
+// Called from inside draw() while the camera transform is still active.
+function drawRemoteCursors() {
+    let list = MP.remoteCursors;
+    if (!list || list.length === 0) return;
+    let scale = Math.max(0.6, Math.min(2.4, 1 / camera.zoom));
+    for (let c of list) {
+        if (c.peerId === MP.selfId) continue; // never draw your own cursor
+        if (typeof c.x !== 'number' || typeof c.y !== 'number') continue;
+
+        ctx.save();
+        ctx.translate(c.x, c.y);
+        ctx.scale(scale, scale);
+
+        let color = mpColorForPeer(c.peerId);
+
+        // Pointer arrow (a simple angular cursor shape, tip at the origin).
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, 16);
+        ctx.lineTo(4, 12.5);
+        ctx.lineTo(6.8, 18.5);
+        ctx.lineTo(9.2, 17.3);
+        ctx.lineTo(6.6, 11.2);
+        ctx.lineTo(12, 11);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.lineWidth = 1.4;
+        ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+        ctx.stroke();
+
+        // Username tag.
+        ctx.font = '600 11px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        let label = c.username || 'Player';
+        let padX = 5;
+        let textW = ctx.measureText(label).width;
+        let boxX = 13, boxY = 14, boxH = 16;
+        ctx.fillStyle = color;
+        ctx.fillRect(boxX, boxY, textW + padX * 2, boxH);
+        ctx.fillStyle = '#0b0b0d';
+        ctx.fillText(label, boxX + padX, boxY + 3);
+
+        ctx.restore();
+    }
 }
 
 function drawTrain(train) {
@@ -2728,6 +2790,7 @@ canvas.addEventListener('pointermove', (e) => {
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
+    mpCursorWorld = screenToWorld(sx, sy); // multiplayer: track for cursor broadcast
 
     // A real drag/pan cancels an in-progress emergency-brake hold - holding
     // still is part of the gesture, panning the view is a different intent.
@@ -2843,6 +2906,7 @@ function handleCanvasClick(sx, sy, clientX, clientY) {
 canvas.addEventListener('pointerup', endPan);
 canvas.addEventListener('pointercancel', endPan);
 canvas.addEventListener('pointerleave', () => {
+    mpCursorWorld = null; // multiplayer: stop broadcasting a stale position
     if (isPanning) return;
     if (hoverSignal || hoverTrainId || (manualRouteArmedTrainId && manualRoutePreview)) {
         hoverSignal = null;

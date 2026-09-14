@@ -40,6 +40,30 @@ const TIME_WARP_MIN = 1;
 const TIME_WARP_MAX = 60;
 const SNAPSHOT_HZ = 15;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
+const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
+
+// Trystero's default tracker list includes some (e.g. tracker.files.fm)
+// that reject connections (403) from certain origins - GitHub Pages being
+// one of them in practice. We pin our own list of trackers known to accept
+// WebSocket announces from arbitrary static-site origins, and connect to
+// several at once (trackerRedundancy) so one flaky/blocking tracker
+// doesn't take the whole room down.
+const MP_TRACKER_URLS = [
+    'wss://tracker.openwebtorrent.com',
+    'wss://tracker.btorrent.xyz',
+    'wss://tracker.webtorrent.dev'
+];
+
+// STUN handles NAT traversal for the common case; the Open Relay Project's
+// free TURN tier is a fallback for players behind stricter (symmetric /
+// carrier-grade / corporate) NATs where a direct path can't be found.
+const MP_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+];
 
 function mpRandomRoomCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I - easy to read aloud
@@ -54,6 +78,16 @@ function mpDefaultPermissions() {
         depotSpawnDespawn: true,
         lineAndSignalControl: true
     };
+}
+
+// Deterministic color per player, derived from their Trystero peerId, so
+// every client independently draws the same player in the same color
+// without the host needing to assign and broadcast one.
+function mpColorForPeer(peerId) {
+    let hash = 0;
+    for (let i = 0; i < peerId.length; i++) hash = (hash * 31 + peerId.charCodeAt(i)) | 0;
+    let hue = Math.abs(hash) % 360;
+    return `hsl(${hue}, 75%, 60%)`;
 }
 
 // ============================================================
@@ -75,9 +109,11 @@ const MP = {
     myPermissions: mpDefaultPermissions(), // client-only: my own cached permissions
     pingMs: null,                           // client-only: my RTT to the host
     playerListCache: [],                    // last known player list (both sides, for HUD rendering)
+    remoteCursors: [],                      // [{peerId, username, x, y}] - other players' cursors, world coords
 
     _lastSnapshotAt: 0,
     _lastPingAt: 0,
+    _lastCursorAt: 0,
     _send: null, // (data, targetPeerId?) => void, set once the room opens
 
     // ---------------- Permission helpers (used all over game.js) ----------------
@@ -229,7 +265,12 @@ const MP = {
 
     _openRoom(code) {
         try {
-            this.room = window.trystero.joinRoom({ appId: MP_APP_ID }, code);
+            this.room = window.trystero.joinRoom({
+                appId: MP_APP_ID,
+                trackerUrls: MP_TRACKER_URLS,
+                trackerRedundancy: MP_TRACKER_URLS.length,
+                rtcConfig: { iceServers: MP_ICE_SERVERS }
+            }, code);
             this.selfId = window.trystero.selfId;
             const [sendMsg, getMsg] = this.room.makeAction('msg');
             this._send = (data, target) => sendMsg(data, target);
@@ -266,6 +307,7 @@ const MP = {
             case 'JOIN_REQUEST': this._hostHandleJoinRequest(data, peerId); break;
             case 'MAP_ACK': this._hostHandleMapAck(peerId); break;
             case 'INPUT_CMD': this._hostHandleInput(data.cmd, peerId); break;
+            case 'CURSOR': this._hostHandleCursor(data, peerId); break;
             case 'PING': this._send({ type: 'PONG', t: data.t }, peerId); break;
             case 'PONG': this._hostHandlePong(data, peerId); break;
         }
@@ -378,12 +420,25 @@ const MP = {
         this._broadcastPlayerList();
     },
 
+    _hostHandleCursor(data, peerId) {
+        let p = this.players[peerId];
+        if (!p) return;
+        p.cursor = (typeof data.x === 'number' && typeof data.y === 'number') ? { x: data.x, y: data.y } : null;
+    },
+
     buildSnapshot() {
+        let cursors = [];
+        for (let peerId in this.players) {
+            let p = this.players[peerId];
+            let pos = p.isHost ? mpCursorWorld : p.cursor;
+            if (pos) cursors.push({ peerId, username: p.username, x: pos.x, y: pos.y });
+        }
         return {
             type: 'STATE_SNAPSHOT',
             simTimeSeconds, simSpeed, simPaused, gameOver,
             trains: trains,
-            signals: state.signals.map(s => ({ id: s.id, state: s.state }))
+            signals: state.signals.map(s => ({ id: s.id, state: s.state })),
+            cursors
         };
     },
 
@@ -441,6 +496,7 @@ const MP = {
             let sig = state.signals.find(x => x.id === s.id);
             if (sig) sig.state = s.state;
         }
+        this.remoteCursors = data.cursors || [];
         updateClockDisplay();
         document.getElementById('btn-pause').innerHTML = simPaused ? '&#9654;' : '&#10074;&#10074;';
         speedSlider.value = simSpeed;
@@ -454,7 +510,9 @@ const MP = {
         if (!this.active) return;
         if (this.started && now - this._lastSnapshotAt >= 1000 / SNAPSHOT_HZ) {
             this._lastSnapshotAt = now;
-            this._send(this.buildSnapshot());
+            let snap = this.buildSnapshot();
+            this.remoteCursors = snap.cursors; // so the host's own draw() sees everyone too
+            this._send(snap);
         }
         if (now - this._lastPingAt >= PING_INTERVAL_MS) {
             this._lastPingAt = now;
@@ -469,6 +527,14 @@ const MP = {
         if (now - this._lastPingAt >= PING_INTERVAL_MS) {
             this._lastPingAt = now;
             this._send({ type: 'PING', t: performance.now() });
+        }
+        if (now - this._lastCursorAt >= CURSOR_INTERVAL_MS) {
+            this._lastCursorAt = now;
+            this._send({
+                type: 'CURSOR',
+                x: mpCursorWorld ? mpCursorWorld.x : null,
+                y: mpCursorWorld ? mpCursorWorld.y : null
+            });
         }
     }
 };
