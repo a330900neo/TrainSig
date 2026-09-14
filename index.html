@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>TrainSig</title>
-<link rel="icon" type="image/png" href="/icon.png">
+<link rel="icon" type="image/png" href="./icon.png">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap');
 
@@ -165,13 +165,13 @@
         <path class="route-path" d="M 40 200 C 160 200, 160 40, 310 40 C 460 40, 460 200, 580 200" />
         <path class="route-path-fill" d="M 40 200 C 160 200, 160 40, 310 40 C 460 40, 460 200, 580 200" />
 
-        <a class="stop" tabindex="-1" href="#play" id="link-play">
+        <a class="stop" tabindex="-1" href="./game/" id="link-play">
           <circle class="stop-dot" cx="40" cy="200" r="9" />
           <text class="stop-label" x="40" y="228" text-anchor="middle">Play</text>
           <text class="stop-sub" x="40" y="176" text-anchor="middle">run the network</text>
         </a>
 
-        <a class="stop" tabindex="-1" href="/builder" id="link-build">
+        <a class="stop" tabindex="-1" href="./builder/" id="link-build">
           <circle class="stop-dot" cx="580" cy="200" r="9" />
           <text class="stop-label" x="580" y="228" text-anchor="middle">Build</text>
           <text class="stop-sub" x="580" y="176" text-anchor="middle">open editor</text>
@@ -188,10 +188,10 @@
 
   <script>
     function goToBuilder(){
-      window.location.href = '/builder';
+      window.location.href = './builder/';
     }
     function goToPlay(){
-      window.location.href = '/game';
+      window.location.href = './game/';
     }
     document.getElementById('link-play').addEventListener('click', function(e){
       e.preventDefault();
