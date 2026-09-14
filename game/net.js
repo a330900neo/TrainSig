@@ -42,13 +42,17 @@ const SNAPSHOT_HZ = 15;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
 const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
 
-// Trystero's default tracker list includes some (e.g. tracker.files.fm)
+// Trystero's default relay list includes some trackers (e.g. tracker.files.fm)
 // that reject connections (403) from certain origins - GitHub Pages being
 // one of them in practice. We pin our own list of trackers known to accept
 // WebSocket announces from arbitrary static-site origins, and connect to
-// several at once (trackerRedundancy) so one flaky/blocking tracker
-// doesn't take the whole room down.
-const MP_TRACKER_URLS = [
+// several at once (relayRedundancy) so one flaky/blocking tracker doesn't
+// take the whole room down.
+// NOTE: as of Trystero 0.18.0 these options were renamed from
+// trackerUrls/trackerRedundancy to relayUrls/relayRedundancy - using the
+// old names on 0.19.0+ silently does nothing (unknown config keys are
+// ignored), which is why the old fix here didn't actually take effect.
+const MP_RELAY_URLS = [
     'wss://tracker.openwebtorrent.com',
     'wss://tracker.btorrent.xyz',
     'wss://tracker.webtorrent.dev'
@@ -265,10 +269,12 @@ const MP = {
 
     _openRoom(code) {
         try {
+            // Note: relayRedundancy is ignored by Trystero whenever relayUrls
+            // is also given - passing an explicit list means the whole list
+            // is used, which is exactly what we want here.
             this.room = window.trystero.joinRoom({
                 appId: MP_APP_ID,
-                trackerUrls: MP_TRACKER_URLS,
-                trackerRedundancy: MP_TRACKER_URLS.length,
+                relayUrls: MP_RELAY_URLS,
                 rtcConfig: { iceServers: MP_ICE_SERVERS }
             }, code);
             this.selfId = window.trystero.selfId;
