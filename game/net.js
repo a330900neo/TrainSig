@@ -5,9 +5,11 @@
  * All game traffic (state snapshots, inputs, ping) flows directly
  * peer-to-peer over WebRTC data channels via Trystero
  * (https://github.com/dmotz/trystero). Trystero only uses free public
- * BitTorrent trackers to let two browsers find each other and exchange
- * WebRTC connection info ("signaling") - once that handshake completes,
+ * Nostr relays to let two browsers find each other and exchange WebRTC
+ * connection info ("signaling") - once that handshake completes,
  * signaling is no longer involved. We run and pay for nothing.
+ * (We use Trystero's Nostr strategy rather than its BitTorrent one - see
+ * the comment above MP_RELAY_URLS below for why.)
  *
  * AUTHORITY MODEL:
  * Host-authoritative. The host is the only machine that runs the real
@@ -42,20 +44,25 @@ const SNAPSHOT_HZ = 15;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
 const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
 
-// Trystero's default relay list includes some trackers (e.g. tracker.files.fm)
-// that reject connections (403) from certain origins - GitHub Pages being
-// one of them in practice. We pin our own list of trackers known to accept
-// WebSocket announces from arbitrary static-site origins, and connect to
-// several at once (relayRedundancy) so one flaky/blocking tracker doesn't
-// take the whole room down.
-// NOTE: as of Trystero 0.18.0 these options were renamed from
-// trackerUrls/trackerRedundancy to relayUrls/relayRedundancy - using the
-// old names on 0.19.0+ silently does nothing (unknown config keys are
-// ignored), which is why the old fix here didn't actually take effect.
+// Signaling relay list: we pin our own relays rather than trusting
+// Trystero's defaults, for two reasons learned the hard way:
+//   1. Some individual relays reject connections (403) from certain origins
+//      like GitHub Pages.
+//   2. Any hostname containing the word "tracker" - which is how every
+//      BitTorrent tracker is named - gets silently blocked outright by many
+//      ad-blocking/privacy browser extensions (they filter on that keyword).
+//      That ruled out the BitTorrent strategy entirely for a chunk of
+//      players, not just a chunk of trackers.
+// Nostr sidesteps both: its relays are plain "relay.xxx"/"nos.lol"-style
+// names with no "tracker" in sight, and it's Trystero's own recommended
+// strategy for redundancy (hundreds of independent public relays exist).
+// See index.html's <script type="module"> for the matching import
+// ('trystero@x/nostr').
 const MP_RELAY_URLS = [
-    'wss://tracker.openwebtorrent.com',
-    'wss://tracker.btorrent.xyz',
-    'wss://tracker.webtorrent.dev'
+    'wss://relay.damus.io',
+    'wss://nos.lol',
+    'wss://relay.nostr.band',
+    'wss://nostr.wine'
 ];
 
 // STUN handles NAT traversal for the common case; the Open Relay Project's
