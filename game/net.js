@@ -43,7 +43,20 @@ const CURSOR_INTERVAL_MS = 100;   // 10Hz cursor position updates
 
 // No hosted signaling or relay is used: host candidates are enough for
 // browsers on the same local network.
-const MP_ICE_SERVERS = [];
+const MP_ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' }
+];
+
+const MP_APP_ID = 'trainsig-v1';
+function mpHostPeerId(roomCode) {
+    return MP_APP_ID + '-' + roomCode;
+}
+function mpRandomRoomCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    return code;
+}
 
 function mpDefaultPermissions() {
     return {
@@ -660,6 +673,20 @@ MP._send = function (data, target) {
     }
 };
 
+MP._hostOnConnection = function (conn) {
+    let peerId = conn.peer;
+    this.conns[peerId] = conn;
+    conn.on('data', data => this._onMessage(data, peerId));
+    conn.on('close', () => this._onPeerLeave(peerId));
+    conn.on('error', err => console.error('PeerJS host connection error:', err));
+};
+
+MP.leaveRoom = function () {
+    this.active = false;
+    if (this.peer) this.peer.destroy();
+    window.location.href = window.location.pathname;
+};
+
 MP.hostRoom = async function (username, opts) {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
     try {
@@ -723,6 +750,77 @@ MP.leaveRoom = function () {
     this.active = false;
     if (this.peer) this.peer.close();
     window.location.href = window.location.pathname;
+};
+
+// Simple room-code transport for static hosting. PeerJS is only used for
+// discovery/signaling; game traffic remains on the direct WebRTC channel.
+MP.hostRoom = function (username, opts) {
+    if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
+    this.username = username;
+    this.isHost = true;
+    this.roomSettings.limit = 1;
+    this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
+    this._hostOpen(3);
+};
+
+MP.joinRoom = function (code, username) {
+    let roomCode = (code || '').trim().toUpperCase();
+    if (!roomCode) { showToast('Enter a room code.'); return; }
+    this._whenReady(() => {
+        this.username = username;
+        this.isHost = false;
+        this.roomCode = roomCode;
+        let peer;
+        try {
+            peer = new window.Peer({ config: { iceServers: MP_ICE_SERVERS } });
+        } catch (err) {
+            console.error('PeerJS client init error:', err);
+            showToast("Couldn't open a multiplayer connection. Check your connection and try again.");
+            return;
+        }
+        this.peer = peer;
+        document.body.classList.add('mp-client-mode');
+        UI.showLobby(false);
+        UI.setLobbyWaitingText('Connecting to host...');
+        let connected = false;
+        peer.on('open', id => {
+            this.selfId = id;
+            let conn = peer.connect(mpHostPeerId(roomCode), { reliable: true });
+            this.hostConn = conn;
+            conn.on('open', () => {
+                connected = true;
+                this.active = true;
+                this._send({ type: 'JOIN_REQUEST', username: this.username });
+            });
+            conn.on('data', data => this._onMessage(data, mpHostPeerId(roomCode)));
+            conn.on('close', () => this._clientHandleDisconnect());
+            conn.on('error', err => console.error('PeerJS client connection error:', err));
+        });
+        peer.on('error', err => {
+            console.error('PeerJS client error:', err);
+            if (!connected) {
+                showToast(err && err.type === 'peer-unavailable'
+                    ? "Couldn't find that room. Check the code."
+                    : "Couldn't reach the host. Check both players are online.");
+                this.leaveRoom();
+            }
+        });
+    });
+};
+
+MP._send = function (data, target) {
+    if (this.isHost) {
+        if (target) {
+            let conn = this.conns[target];
+            if (conn && conn.open) conn.send(data);
+        } else {
+            Object.values(this.conns).forEach(conn => {
+                if (conn.open) conn.send(data);
+            });
+        }
+    } else if (this.hostConn && this.hostConn.open) {
+        this.hostConn.send(data);
+    }
 };
 
 // ============================================================
@@ -930,16 +1028,15 @@ window.addEventListener('diagram-loaded', () => UI.updateHostSetupMapStatus());
 document.getElementById('mp-hostsetup-go').addEventListener('click', () => {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
     UI.goUsername(() => {
-        let allowMidJoin = document.getElementById('mp-host-midjoin').checked;
-        MP.hostRoom(UI._pendingUsername, { allowMidGameJoin: allowMidJoin });
+        MP.hostRoom(UI._pendingUsername, { limit: 1, allowMidGameJoin: true });
     });
 });
 
 document.getElementById('mp-btn-join').addEventListener('click', () => UI.show('mp-screen-join'));
 document.getElementById('mp-join-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
 document.getElementById('mp-join-go').addEventListener('click', () => {
-    let offer = document.getElementById('mp-join-offer').value;
-    UI.goUsername(() => MP.joinRoom(offer, UI._pendingUsername));
+    let code = document.getElementById('mp-join-code').value;
+    UI.goUsername(() => MP.joinRoom(code, UI._pendingUsername));
 });
 
 document.getElementById('mp-username-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
@@ -952,26 +1049,25 @@ document.getElementById('mp-username-next').addEventListener('click', () => {
 
 document.getElementById('mp-lobby-start').addEventListener('click', () => MP.startGame());
 document.getElementById('mp-lobby-leave').addEventListener('click', () => MP.leaveRoom());
-document.getElementById('mp-host-connect').addEventListener('click', () => {
-    MP.connectHost(document.getElementById('mp-host-answer').value);
-});
-document.getElementById('mp-host-copy').addEventListener('click', () => {
-    navigator.clipboard.writeText(document.getElementById('mp-host-offer').value)
-        .then(() => showToast('Offer copied.'))
-        .catch(() => showToast('Copy failed. Select and copy the offer manually.'));
-});
-document.getElementById('mp-join-copy').addEventListener('click', () => {
-    navigator.clipboard.writeText(document.getElementById('mp-join-answer').value)
-        .then(() => showToast('Answer copied.'))
-        .catch(() => showToast('Copy failed. Select and copy the answer manually.'));
+document.getElementById('mp-lobby-copy').addEventListener('click', () => {
+    let url = window.location.origin + window.location.pathname + '?room=' + MP.roomCode;
+    navigator.clipboard.writeText(url).then(
+        () => showToast('Invite link copied.'),
+        () => showToast('Room code: ' + MP.roomCode)
+    );
 });
 
 document.getElementById('mp-hud-toggle').addEventListener('click', () => {
     document.getElementById('mp-hud-list').classList.toggle('open');
 });
 
-// ---- Boot: static hosting has no room URLs; the host and guest exchange
-// WebRTC descriptions manually so GitHub Pages needs no backend.
+// ---- Boot: invite links can pre-fill the room code.
 (function mpBoot() {
-    UI.show('mp-screen-main');
+    let roomFromLink = new URLSearchParams(window.location.search).get('room');
+    if (roomFromLink) {
+        document.getElementById('mp-join-code').value = roomFromLink;
+        UI.goUsername(() => MP.joinRoom(roomFromLink, UI._pendingUsername));
+    } else {
+        UI.show('mp-screen-main');
+    }
 })();

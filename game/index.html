@@ -844,7 +844,7 @@
 
     <div class="mp-card hidden" id="mp-screen-mpmenu">
       <h1>Multiplayer</h1>
-      <p>Host a local LAN game, or join one using a copied connection offer.</p>
+      <p>Host a game and share the short room code with your friend.</p>
       <button class="btn btn-primary btn-full" id="mp-btn-host">Host Room</button>
       <button class="btn btn-full" id="mp-btn-join">Join Room</button>
       <button class="btn" id="mp-mpmenu-back">Back</button>
@@ -867,11 +867,7 @@
 
     <div class="mp-card hidden" id="mp-screen-join">
       <h1>Join a room</h1>
-      <p>Ask the host to send their connection offer, then paste it below.</p>
-      <div class="mp-signal">
-        <label for="mp-join-offer">Host offer</label>
-        <textarea id="mp-join-offer" placeholder="Paste the host offer here"></textarea>
-      </div>
+      <input class="panel-input" id="mp-join-code" placeholder="Room code" maxlength="8" style="text-transform:uppercase;letter-spacing:0.1em;">
       <div class="btn-row">
         <button class="btn" id="mp-join-back">Back</button>
         <button class="btn btn-primary" id="mp-join-go">Join</button>
@@ -881,20 +877,9 @@
     <div class="mp-card mp-card-wide hidden" id="mp-screen-lobby">
       <h1 id="mp-lobby-title">Lobby</h1>
       <div class="mp-roomcode-row hidden" id="mp-lobby-roomcode-row">
-        <span>Direct LAN connection</span>
-      </div>
-      <div class="mp-signal hidden" id="mp-host-signaling">
-        <label for="mp-host-offer">1. Send this offer to the other player</label>
-        <textarea id="mp-host-offer" readonly></textarea>
-        <button class="btn btn-sm" id="mp-host-copy">Copy offer</button>
-        <label for="mp-host-answer">2. Paste their answer here</label>
-        <textarea id="mp-host-answer" placeholder="Paste the answer here"></textarea>
-        <button class="btn btn-primary btn-full" id="mp-host-connect">Connect player</button>
-      </div>
-      <div class="mp-signal hidden" id="mp-join-signaling">
-        <label for="mp-join-answer">Send this answer back to the host</label>
-        <textarea id="mp-join-answer" readonly></textarea>
-        <button class="btn btn-sm" id="mp-join-copy">Copy answer</button>
+        <span>Room code:</span>
+        <span class="mp-roomcode" id="mp-lobby-roomcode"></span>
+        <button class="btn btn-sm" id="mp-lobby-copy">Copy invite link</button>
       </div>
       <div class="mp-player-list" id="mp-lobby-players"></div>
       <div id="mp-lobby-hostcontrols" class="hidden">
@@ -1000,7 +985,8 @@
        normal reload doesn't always re-fetch them. Bump this whenever you
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
-  <script src="game.js?v=7"></script>
-  <script src="net.js?v=7"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="game.js?v=8"></script>
+  <script src="net.js?v=8"></script>
 </body>
 </html>
