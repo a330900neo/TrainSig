@@ -95,7 +95,9 @@ const DEFAULT_EMERGENCY_DECEL = 2.8; // m/s^2
 const DEFAULT_TRAIN_CAPACITY = 600;
 const SIGNAL_STOP_MARGIN_M = 4; // trains stop this far short of a red signal
 const LOOKAHEAD_M = 2500; // minimum how far ahead (meters) a train scans for hazards
+const REVERSE_PENALTY_SPEED_KMH = 5; // speed cap applied after reversing outside a turnback/depot area
 const PHYSICS_SUBSTEP_S = 0.1; // max simulated seconds integrated per physics substep
+const TRAIN_STOPPED_MS = 0.05; // speed (m/s) below which a train counts as "stopped" for dwell/teleport purposes
 const TRAIN_HIT_PADDING = 9; // world px (pre-zoom) for tapping a train
 const DEPOT_HIT_PADDING = 14; // world px (pre-zoom) for tapping a depot track
 
@@ -104,6 +106,7 @@ let trains = [];
 let nextTrainSeq = 1;
 let selectedTrainId = null;
 let manualRouteArmedTrainId = null; // train awaiting a map click for a manual destination
+let manualRoutePreview = null; // { points, target, valid } - live route preview under the cursor while armed, recomputed every pointermove
 let gameOver = false;
 let crashAnim = null; // active crash camera/tilt animation - see triggerGameOver() and draw()
 
@@ -123,6 +126,15 @@ let trainHoldTriggered = false;
 
 const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
+
+// Injected once so the emergency-brake speed readout (see updateTrainPanel)
+// can flash red without needing a change to the game's own stylesheet.
+(function injectEbFlashStyle() {
+    let style = document.createElement('style');
+    style.textContent = '.speed-eb-flash { color: #ef4444; animation: eb-speed-blink 0.5s steps(1, start) infinite; }' +
+        '@keyframes eb-speed-blink { 50% { opacity: 0.2; } }';
+    document.head.appendChild(style);
+})();
 
 // ============================================================
 // --- Core math helpers (mirrors Builder) ---
@@ -181,12 +193,60 @@ function canEnterTrack(t, fromP1) {
     return true;
 }
 
-const TURN_DOT_EPSILON = 1e-9;
-function isTurnAllowed(inTrack, inDir, outTrack, outDir) {
+// Maximum angle a train may ever turn through in a single automatically
+// routed move: 90 degrees, full stop. Anything sharper than a right angle
+// isn't a "turn" at all - it's a reversal - and automatic routing is never
+// allowed to perform a reversal on its own, even at a track that's flagged
+// as a turnback or is the train's own home depot. Turnback/depot flags only
+// ever grant the physical ABILITY to reverse in place (see isTurnbackTrack
+// and canReverseInPlace, used by the player's manual Reverse button) - they
+// never grant the pathfinder permission to route a train backward through
+// one unattended. If a train's route requires turning around, the player
+// has to press Reverse themselves; computeTrainRoute simply won't find a
+// path through anything sharper than this, and callers fall back to a
+// toast telling the player a turnback/manual reverse is needed (see
+// routeTrainToLineStop and advanceToNextLineStop).
+const MAX_TURN_ANGLE_DEG = 90;
+const MAX_TURN_DOT = Math.cos(MAX_TURN_ANGLE_DEG * Math.PI / 180); // 0
+
+// Whether a track counts as a place a train is allowed to physically
+// reverse on. Either it's explicitly flagged as a turnback facility, or -
+// new - it's the train's own home depot track: a depot is where a train
+// lives between duties, so it always doubles as an informal reversing
+// point for that train specifically, even if the player never bothered to
+// flag it as a turnback. This only ever applies to the train that calls the
+// depot home - it doesn't make the track a turnback for any other train.
+// Note this only governs the manual Reverse button (see canReverseInPlace);
+// it plays no part in automatic routing at all - see MAX_TURN_DOT above.
+function isTurnbackTrack(track, train) {
+    if (!track) return false;
+    if (track.turnback) return true;
+    return !!(train && track.id === train.homeDepotTrackId);
+}
+
+// Automatic-routing turn gate: allows a move onto another track only if it
+// keeps the train turning by 90 degrees or less. There is deliberately no
+// turnback/depot exception here - see MAX_TURN_DOT's comment. A player who
+// wants their train to actually turn around has to do it themselves with
+// the Reverse button.
+function isTurnAllowed(train, inTrack, inDir, outTrack, outDir) {
     if (!inTrack) return true;
     let dot = inDir.x * outDir.x + inDir.y * outDir.y;
-    if (dot > TURN_DOT_EPSILON) return true;
-    return !!(inTrack.turnback || outTrack.turnback);
+    return dot > MAX_TURN_DOT;
+}
+
+// Whether reversing right where a train is currently standing counts as a
+// "proper" reversal - at a flagged turnback facility or the train's own
+// depot - versus an unauthorized one anywhere else. The player can reverse
+// anywhere (see reverseTrain), but doing it outside one of these decides
+// whether the post-reversal speed penalty kicks in.
+// Flipping in place never moves the train onto a different track - it only
+// ever reinterprets forward/backward on the exact segments it already
+// occupies - so the only thing that matters is whether the track it's
+// currently on counts as reversible for this train.
+function canReverseInPlace(train) {
+    let track = getTrack(train.headTrackId);
+    return isTurnbackTrack(track, train);
 }
 
 function kmhToMs(k) { return k / 3.6; }
@@ -301,6 +361,11 @@ function hitTestSignal(wx, wy) {
 }
 
 function toggleSignal(sig) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control signals."); return; }
+        MP.sendInput({ type: 'TOGGLE_SIGNAL', signalId: sig.id });
+        return;
+    }
     sig.state = (sig.state === 'blue') ? 'red' : 'blue';
     draw();
 }
@@ -376,23 +441,36 @@ function computeTrainRoute(train, targetTrackId, targetDist) {
         if (cur.d > (dist.get(cur.key) ?? Infinity)) continue;
 
         let conn = connectedTracks(cur.pointId);
-        let isRealJunction = conn.length >= 3;
         // A literal dead end (only the track we arrived on touches this
         // point, nothing else touches it) is *not* automatically reversible.
         // Real trains can't just spin around at a plain buffer stop - only a
         // track explicitly flagged as a turnback (a proper reversing
-        // facility) can send them back the way they came. So a dead end is
-        // treated exactly like any other point when it comes to turning:
-        // isTurnAllowed()'s turnback check still applies to it below: no
-        // exemption.
+        // facility) can send them back the way they came. So a dead end, a
+        // plain 2-way point, and a busy multi-track junction are all
+        // treated identically when it comes to turning: isTurnAllowed()'s
+        // turnback check applies below unconditionally, regardless of how
+        // many tracks meet at this point.
 
         if (cur.pointId === targetTrack.p1_id || cur.pointId === targetTrack.p2_id) {
             let atP1 = cur.pointId === targetTrack.p1_id;
             let finalFromP1 = atP1;
             let finalLeg = atP1 ? targetDist : (trackMeters(targetTrack) - targetDist);
             let outDir = trackDirVector(targetTrack, finalFromP1);
-            let isFinalUTurn = cur.arrTrack.id === targetTrack.id;
-            let turnOk = (!isRealJunction && !isFinalUTurn) || isTurnAllowed(cur.arrTrack, cur.inDir, targetTrack, outDir);
+            // The turn-angle check runs unconditionally here, regardless of
+            // whether this point is a busy junction or a plain 2-way point,
+            // and regardless of whether the final track happens to share its
+            // id with the arrival track. A previous version only ran this
+            // check for isRealJunction or a literal same-track id
+            // (isFinalUTurn), which let a genuine 180-degree reversal slip
+            // through unblocked whenever it happened via two DIFFERENT
+            // tracks meeting at a plain 2-connection point - the train's
+            // arrival track and the target track are different track
+            // objects, so isFinalUTurn was false, and the point only has 2
+            // connections, so isRealJunction was false too, leaving nothing
+            // to stop the reversal. Geometry (the dot product inside
+            // isTurnAllowed), not track-id equality or junction size, is
+            // what actually determines whether this is a u-turn.
+            let turnOk = isTurnAllowed(train, cur.arrTrack, cur.inDir, targetTrack, outDir);
             if (canEnterTrack(targetTrack, finalFromP1) && turnOk && finalLeg >= -1e-6) {
                 let total = cur.d + Math.max(0, finalLeg);
                 let gk = 'GOAL@' + cur.key;
@@ -401,17 +479,40 @@ function computeTrainRoute(train, targetTrackId, targetDist) {
                     prev.set(gk, { fromKey: cur.key, endTrack: targetTrack, endAtP1: atP1 });
                     goalKey = gk;
                 }
-                break; // processed in cost order - first arrival is optimal
+                break; // processed in cost order - first *valid* arrival is optimal
             }
+            // Otherwise this particular (point, arrival-track) pairing can't
+            // legally complete the route right here (e.g. it would require
+            // reversing straight onto the target track without a turnback).
+            // Previously this unconditionally `break`-ed the whole search the
+            // instant ANY state touching the target track's endpoints was
+            // dequeued, even an invalid one - discarding every other,
+            // possibly perfectly legal, approach still sitting in the queue.
+            // Falling through into the normal neighbor expansion below
+            // instead lets the search keep looking for a legal way in.
         }
 
         for (let t of conn) {
-            let isUTurn = t.id === cur.arrTrack.id;
-            if (isUTurn && conn.length > 1) continue;
             let fromP1 = t.p1_id === cur.pointId;
             if (!canEnterTrack(t, fromP1)) continue;
             let outDir = trackDirVector(t, fromP1);
-            if ((isRealJunction || isUTurn) && !isTurnAllowed(cur.arrTrack, cur.inDir, t, outDir)) continue;
+            // The turn-angle check runs unconditionally for every candidate
+            // neighbor - continuing back the way the train came is only
+            // ever legal onto a track flagged (for this train) as a
+            // turnback facility, and that's decided purely by geometry (see
+            // isTurnAllowed's dot product), never by track id or by how
+            // many tracks meet at this point. A previous version only ran
+            // this check when the point was a real junction (3+ tracks) or
+            // the candidate was literally the same track id as the one just
+            // arrived on (isUTurn) - which meant a genuine 180-degree
+            // reversal onto a plain 2-connection point, via a track that
+            // merely happens to have a DIFFERENT id but still points
+            // straight back the way the train came, sailed through
+            // unchecked every single time. Every step now gets the same
+            // strict check, so a "current track -> next track" reversal can
+            // never slip through just because it isn't a busy junction or
+            // isn't literally the same track object.
+            if (!isTurnAllowed(train, cur.arrTrack, cur.inDir, t, outDir)) continue;
 
             let otherPoint = fromP1 ? t.p2_id : t.p1_id;
             let cost = trackMeters(t);
@@ -436,6 +537,37 @@ function computeTrainRoute(train, targetTrackId, targetDist) {
         if (!p || p.isStart) break;
         edges.unshift({ trackId: p.track.id, forward: p.fromP1 });
         ck = p.fromKey;
+    }
+
+    // Final structural safety net: a real route can never use the same
+    // track twice back-to-back - that's a literal in-place reversal (a
+    // u-turn), not a step to a "next" track at all - unless that track is
+    // an actual turnback facility the train is entitled to reverse on. The
+    // search above is already built to exclude this while expanding, but
+    // double-checking the fully reconstructed path means a u-turn can never
+    // slip through undetected: if one somehow shows up here anyway, treat
+    // the whole route as unreachable rather than ever handing the train a
+    // path that would require it to drive back onto the track it's already
+    // just left.
+    let prevTrackId = curTrack.id;
+    for (let e of edges) {
+        if (e.trackId === prevTrackId && !isTurnbackTrack(getTrack(e.trackId), train)) return null;
+        prevTrackId = e.trackId;
+    }
+
+    // A subtler version of the same problem: hopping out via a short
+    // connecting track at a busy junction and straight back onto the
+    // train's OWN starting track is still a net reversal through its own
+    // start, even though no two edges in the list are back-to-back
+    // identical (the consecutive check above can't see it). The one
+    // legitimate way the starting track can reappear is as the genuine
+    // final destination itself - reaching it via a real loop back around,
+    // which the goal-check above already vetted with the same
+    // isFinalUTurn/isTurnAllowed turnback logic. Any OTHER, non-final
+    // reappearance of it mid-route is always an illegitimate detour back
+    // through the start.
+    for (let i = 0; i < edges.length - 1; i++) {
+        if (edges[i].trackId === curTrack.id && !isTurnbackTrack(curTrack, train)) return null;
     }
 
     return { edges, directOnCurrent: false, totalMeters: dist.get(goalKey) };
@@ -524,6 +656,14 @@ function pickSpawnDirection(track) {
 }
 
 function spawnTrainAt(track) {
+    // Multiplayer: only the host actually mutates simulation state. A
+    // non-host client just asks the host to do this and waits for the
+    // resulting train to show up in the next state snapshot.
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('depotSpawnDespawn')) { showToast("You don't have permission to spawn trains."); return; }
+        MP.sendInput({ type: 'SPAWN_TRAIN', trackId: track.id });
+        return;
+    }
     let forward = pickSpawnDirection(track);
     let lenM = trackMeters(track);
     let trainLen = parseNum(track.trainLength, DEFAULT_TRAIN_LENGTH_M);
@@ -541,6 +681,7 @@ function spawnTrainAt(track) {
         emergDecelMs2: parseNum(track.emergencyDeceleration, DEFAULT_EMERGENCY_DECEL),
         capacity: (typeof track.trainCapacity === 'number' && track.trainCapacity > 0) ? track.trainCapacity : DEFAULT_TRAIN_CAPACITY,
         speedCapKmh: null,
+        reversePenaltyActive: false, // true after reversing outside a turnback/depot - caps speed at REVERSE_PENALTY_SPEED_KMH until reversed again
         speedMs: 0,
         headTrackId: track.id,
         headDist: headDist,
@@ -549,6 +690,7 @@ function spawnTrainAt(track) {
         route: [],
         targetTrackId: null,
         targetDist: null,
+        targetForward: null, // heading the train will be facing once it reaches targetTrackId/targetDist
         mode: 'idle', // 'idle' | 'line' | 'manual'
         stopIndex: 0,
         direction: 1,
@@ -564,7 +706,6 @@ function spawnTrainAt(track) {
         lastBoarded: 0,
         platformOverrides: {},
         _occ: null,
-        _lineJustAssigned: false,
         stuckNoticeShown: false
     };
     train._occ = getOccupiedEdges(train);
@@ -581,6 +722,11 @@ function isTrainFullyInHomeDepot(train) {
 }
 
 function despawnTrain(train) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('depotSpawnDespawn')) { showToast("You don't have permission to despawn trains."); return; }
+        MP.sendInput({ type: 'DESPAWN_TRAIN', trainId: train.id });
+        return;
+    }
     trains = trains.filter(t => t.id !== train.id);
     if (selectedTrainId === train.id) closeTrainPanel();
     showToast('Train ' + train.label + ' despawned.');
@@ -657,10 +803,11 @@ function edgeBound(train, trackId, forward) {
 }
 
 // Scans ahead of the train (current track remainder + queued route) for
-// signals, speed-limit changes, other trains' tails, and its own final
-// target, returning cumulative meters-ahead for each.
+// signals, speed-limit changes, other trains' tails, its own final target,
+// and any turnback reversal points, returning cumulative meters-ahead for
+// each.
 function gatherLookahead(train) {
-    let result = { cumToTarget: null, signals: [], speedZones: [] };
+    let result = { cumToTarget: null, signals: [], speedZones: [], reversals: [] };
     let cum = 0;
     // How far ahead this train actually needs to scan to see a stop point in
     // time: its own normal-braking stopping distance (with margin), floored
@@ -670,22 +817,42 @@ function gatherLookahead(train) {
     let brakingDist = (train.speedMs * train.speedMs) / (2 * Math.max(0.01, train.accelMs2));
     let lookaheadLimit = Math.max(LOOKAHEAD_M, brakingDist * 1.5);
 
+    // Meters of slack applied when deciding whether a signal's position
+    // falls inside the window currently being scanned. A signal that sits
+    // essentially right on top of a junction node (t_dist snapped to 0 or
+    // the track's full length, which is exactly where a signal "protecting"
+    // a multi-track node is normally placed) can land a hair outside the
+    // window from ordinary floating point drift in the geometry - the old
+    // 1e-6 tolerance was tight enough that this happened, and a signal
+    // excluded here is a signal the lookahead - and therefore the train -
+    // never sees at all, not just late. A generous, still-tiny, real-world
+    // tolerance closes that gap without meaningfully changing where signals
+    // are considered to apply.
+    const SIGNAL_WINDOW_EPS_M = 0.05;
+
     function scanWindow(t, forward, fromM, toM, cumStart) {
         result.speedZones.push({ cum: cumStart, limit: (typeof t.speedLimit === 'number' ? t.speedLimit : null) });
         let low = Math.min(fromM, toM), high = Math.max(fromM, toM);
 
         for (let s of state.signals) {
             if (s.track_id !== t.id) continue;
-            // A signal's `direction` is the way its arrow points (the travel
-            // direction it permits/protects past itself), so it governs
-            // trains approaching it from the OPPOSITE way - i.e. a train
-            // travelling forward (p1->p2) is governed by a signal whose
-            // arrow points p2->p1 (direction -1), not one pointing the same
-            // way it's already going.
+            // A signal's `direction` is the way its arrow (its physical
+            // pointer) points, as rendered in getSignalGeom's `facing`
+            // (direction=1 draws the arrow facing forward, p1->p2;
+            // direction=-1 draws it facing backward, p2->p1) - and it
+            // blocks/protects a train travelling in the OPPOSITE direction
+            // to that arrow: the signal faces back toward the train it's
+            // protecting, the way a real signal's lens faces the oncoming
+            // train rather than pointing the way that train is heading.
+            // This is the sole, authoritative reference for whether a
+            // signal applies to a given train's movement - a track can
+            // carry signals for both directions at once (e.g. one
+            // protecting each way into a junction), and only the one whose
+            // arrow faces the train is ever relevant to it.
             let matches = (s.direction === 1 && !forward) || (s.direction === -1 && forward);
             if (!matches) continue;
             let pos = pxToMeters(t, s.t_dist);
-            if (pos < low - 1e-6 || pos > high + 1e-6) continue;
+            if (pos < low - SIGNAL_WINDOW_EPS_M || pos > high + SIGNAL_WINDOW_EPS_M) continue;
             let distAlong = forward ? (pos - fromM) : (fromM - pos);
             result.signals.push({ cum: cumStart + Math.max(0, distAlong), state: s.state });
         }
@@ -703,15 +870,44 @@ function gatherLookahead(train) {
         return result;
     }
 
+    // A turnback reversal is a real, physical direction change - the
+    // train's route bends back through more than 90 degrees at a depot or
+    // flagged turnback point - not a pass-through junction. Critically, this
+    // is NOT limited to the train doubling back onto the exact same track
+    // it arrived on: a depot is very often its own short stub track, so
+    // leaving it means moving onto a genuinely different track object that
+    // just happens to point back the way the train came. Detecting only
+    // same-trackId reversals (an earlier version of this check) missed
+    // that entirely - a depot-stub-to-mainline reversal has two different
+    // track ids on either side of the turn, so it sailed straight through
+    // ungated. The correct test is the same geometric one the pathfinder
+    // itself uses to decide what counts as a reversal in the first place
+    // (see isTurnAllowed): the dot product of the direction the train was
+    // travelling and the direction it's about to travel. Any turn sharp
+    // enough to be a genuine reversal (dot <= MAX_TURN_DOT) - regardless
+    // of whether the two tracks share an id - must bring the train to a
+    // full stop first, exactly like a red signal or its own final target.
+    // Without this, the train sails through the reversal at line speed and
+    // comes out the other side already moving - which reads on screen as an
+    // instantaneous, still-moving spin-around (a "u-turn") rather than a
+    // proper decelerate-stop-reverse turnback.
+    let prevDir = trackDirVector(curTrack, forward);
+
     for (let e of train.route) {
         if (cum > lookaheadLimit) break;
         let t = getTrack(e.trackId);
         if (!t) break;
+        let eDir = trackDirVector(t, e.forward);
+        let dot = prevDir.x * eDir.x + prevDir.y * eDir.y;
+        if (dot <= MAX_TURN_DOT) {
+            result.reversals.push({ cum });
+        }
         let L = trackMeters(t);
         let from = e.forward ? 0 : L;
         let to = edgeBound(train, e.trackId, e.forward);
         scanWindow(t, e.forward, from, to, cum);
         cum += Math.abs(to - from);
+        prevDir = eDir;
         if (e.trackId === train.targetTrackId && train.targetDist != null) {
             result.cumToTarget = cum;
             break;
@@ -754,6 +950,13 @@ function stepTrainPhysics(train, dt) {
     for (let sig of lookahead.signals) {
         if (sig.state !== 'blue') stopDistances.push(Math.max(0, sig.cum - SIGNAL_STOP_MARGIN_M));
     }
+    // A turnback point must bring the train fully to rest before it heads
+    // back the other way - see the comment on `reversals` in
+    // gatherLookahead. Treated as a hard stop, exactly like a red signal or
+    // the train's own final target.
+    for (let rev of lookahead.reversals) {
+        stopDistances.push(Math.max(0, rev.cum));
+    }
     let nearestStopDist = stopDistances.length ? Math.min(...stopDistances) : Infinity;
     let normalStopDist = (train.speedMs * train.speedMs) / (2 * train.accelMs2);
     train.autoEmergencyBrake = !train.emergencyBrake && nearestStopDist < normalStopDist - 1e-6;
@@ -764,10 +967,16 @@ function stepTrainPhysics(train, dt) {
     let curLimit = currentTrackSpeedLimitKmh(train);
     if (curLimit != null) constraints.push({ d: 0, v: kmhToMs(curLimit) });
     if (train.speedCapKmh != null && train.speedCapKmh >= 0) constraints.push({ d: 0, v: kmhToMs(train.speedCapKmh) });
+    // A reversal performed outside a proper turnback/depot area leaves the
+    // train crawling until it reverses again - see reverseTrain.
+    if (train.reversePenaltyActive) constraints.push({ d: 0, v: kmhToMs(REVERSE_PENALTY_SPEED_KMH) });
     if (train.emergencyBrake) constraints.push({ d: 0, v: 0 });
     if (lookahead.cumToTarget != null) constraints.push({ d: Math.max(0, lookahead.cumToTarget), v: 0 });
     for (let sig of lookahead.signals) {
         if (sig.state !== 'blue') constraints.push({ d: Math.max(0, sig.cum - SIGNAL_STOP_MARGIN_M), v: 0 });
+    }
+    for (let rev of lookahead.reversals) {
+        constraints.push({ d: Math.max(0, rev.cum), v: 0 });
     }
     for (let zone of lookahead.speedZones) {
         if (zone.limit != null) constraints.push({ d: Math.max(0, zone.cum), v: kmhToMs(zone.limit) });
@@ -812,6 +1021,73 @@ function getTrainPathPoints(train) {
         let p = pointAtMeters(t2, to);
         if (p) pts.push(p);
         if (e.trackId === train.targetTrackId && train.targetDist != null) break;
+    }
+    return pts;
+}
+
+// World-space polyline points for the leg AFTER the train's current target -
+// i.e. the further pathfind, from wherever it's currently headed on to the
+// stop after that. Purely a preview: computed fresh on demand from a
+// lightweight virtual train state sitting at the current target, and never
+// written back into the train's own route/target, so it has zero effect on
+// actual navigation. Only meaningful for a train working a line; manual
+// routes and idle trains have no "next" stop to preview.
+function getTrainNextPathPoints(train) {
+    if (!train.lineId || !train.pendingStop || train.targetTrackId == null) return [];
+    let line = getLine(train.lineId);
+    if (!line || !Array.isArray(line.stops) || line.stops.length < 2) return [];
+    let n = line.stops.length;
+    // The line now ends (unassigns) at its last stop rather than looping
+    // back - see simTick - so there's nothing further to preview from there.
+    if (train.stopIndex === n - 1) return [];
+    let nextIndex = train.stopIndex + train.direction;
+    if (nextIndex < 0 || nextIndex >= n) return [];
+
+    let stop = line.stops[nextIndex];
+    let plats = getStopPlatforms(stop);
+    if (!plats.length) return [];
+
+    let virtualTrain = {
+        headTrackId: train.targetTrackId,
+        headDist: train.targetDist,
+        headForward: (train.targetForward != null) ? train.targetForward : train.headForward,
+        homeDepotTrackId: train.homeDepotTrackId,
+        targetTrackId: null,
+        targetDist: null
+    };
+
+    let overrideId = train.platformOverrides && train.platformOverrides[stop.id];
+    let candidates = (overrideId && plats.some(p => p.id === overrideId)) ? plats.filter(p => p.id === overrideId) : plats;
+
+    let bestRoute = null, bestLen = Infinity, chosenTrackId = null, chosenDist = null;
+    for (let p of candidates) {
+        let t = getTrack(p.track_id);
+        if (!t) continue;
+        let targetM = pxToMeters(t, p.t_dist);
+        let route = computeTrainRoute(virtualTrain, p.track_id, targetM);
+        if (route && route.totalMeters < bestLen) {
+            bestLen = route.totalMeters; bestRoute = route; chosenTrackId = p.track_id; chosenDist = targetM;
+        }
+    }
+    if (!bestRoute) return [];
+
+    let pts = [];
+    let startTrack = getTrack(virtualTrain.headTrackId);
+    if (!startTrack) return [];
+    let startPt = pointAtMeters(startTrack, virtualTrain.headDist);
+    if (startPt) pts.push(startPt);
+
+    if (bestRoute.directOnCurrent) {
+        let p = pointAtMeters(startTrack, chosenDist);
+        if (p) pts.push(p);
+        return pts;
+    }
+    for (let e of bestRoute.edges) {
+        let t2 = getTrack(e.trackId);
+        if (!t2) break;
+        let to = (e.trackId === chosenTrackId) ? chosenDist : (e.forward ? trackMeters(t2) : 0);
+        let p = pointAtMeters(t2, to);
+        if (p) pts.push(p);
     }
     return pts;
 }
@@ -871,39 +1147,66 @@ function onTrainArrive(train) {
     if (selectedTrainId === train.id) updateTrainPanel();
 }
 
-// Advances a line-assigned train to its next stop (wrapping direction at
-// the ends of the line, so it shuttles back and forth automatically).
+// Advances a line-assigned train to its next stop, one stop at a time in
+// whichever direction it's currently working. Normal one-way service never
+// reaches this function already sitting at the last stop - simTick
+// intercepts that and unassigns the train's line entirely instead (see the
+// dwell-elapsed handling there); startReturnToFirstStop() is only used for
+// the initial non-stop run to a line's first stop when a train is freshly
+// assigned to it.
 function advanceToNextLineStop(train) {
     let line = getLine(train.lineId);
     if (!line || !line.stops || line.stops.length < 2) { train.mode = 'idle'; return; }
     let n = line.stops.length;
     let nextIndex = train.stopIndex + train.direction;
-    if (nextIndex < 0) { train.direction = 1; nextIndex = Math.min(1, n - 1); }
-    else if (nextIndex >= n) { train.direction = -1; nextIndex = Math.max(n - 2, 0); }
+    // Defensive clamp in case stopIndex/direction ever end up out of range.
+    if (nextIndex < 0) nextIndex = 0;
+    else if (nextIndex >= n) nextIndex = n - 1;
 
-    let stop = line.stops[nextIndex];
+    routeTrainToLineStop(train, line, nextIndex, line.stops[nextIndex]);
+}
+
+// The actual pathfind-to-a-stop body, factored out of advanceToNextLineStop
+// so it can also be used to re-path a train to the stop it's ALREADY
+// working (same stopIndex, no service progress change) after an in-place
+// manual reverse - see reverseTrain.
+function routeTrainToLineStop(train, line, stopIndex, stop) {
     let plats = getStopPlatforms(stop);
     if (!plats.length) { train.mode = 'idle'; showToast('Line "' + line.name + '" has a stop with no platform.'); return; }
 
-    // Try up to twice: once with the train's current physical heading, and -
-    // if that finds no route at all - once more after physically flipping it
-    // in place. A terminus stop is very often a dead end the train arrived
-    // at nose-first, so continuing "forward" without a turnback isn't
-    // reachable by pathfinding alone; it has to actually turn around first,
-    // the same way the player's manual Reverse button does.
-    for (let attempt = 0; attempt < 2; attempt++) {
+    // computeTrainRoute's own search already explores turning the train
+    // around right where it's currently standing (subject to the same
+    // turnback rules as any other junction - see isTurnAllowed), so a single
+    // pass is enough; a previous version of this function used to retry with
+    // an unconditional flipTrainHeadingInPlace() when the first attempt
+    // failed, but that bypassed the turnback requirement entirely (it
+    // physically performed the very reversal that had just been correctly
+    // refused, then simply re-asked whether continuing forward from the new,
+    // already-illegally-rotated heading worked - which of course it did).
+    // That effectively let trains u-turn at any plain dead end, so it's gone.
+    {
         let overrideId = train.platformOverrides && train.platformOverrides[stop.id];
         let candidates = plats;
         if (overrideId && plats.some(p => p.id === overrideId)) candidates = plats.filter(p => p.id === overrideId);
 
         // Prefer a platform the train is already standing at (see
         // isTrainAtPlatform for why computeTrainRoute alone can miss this).
+        // Only take this zero-cost shortcut while the train is actually
+        // stopped (or effectively so) - isTrainAtPlatform only checks
+        // physical overlap with the platform marker, so a train still
+        // rolling through at speed could otherwise be treated as "arrived"
+        // and skipped straight past proper braking, arriving (and starting
+        // its dwell) without ever having come to a stop. A moving train
+        // instead falls through to the normal route search below, which
+        // gives it a real target to brake down to.
         let chosen = null, bestRoute = null, bestLen = Infinity;
-        for (let p of candidates) {
-            if (isTrainAtPlatform(train, p)) {
-                chosen = p; bestLen = 0;
-                bestRoute = { edges: [], directOnCurrent: true, totalMeters: 0 };
-                break;
+        if (train.speedMs < TRAIN_STOPPED_MS) {
+            for (let p of candidates) {
+                if (isTrainAtPlatform(train, p)) {
+                    chosen = p; bestLen = 0;
+                    bestRoute = { edges: [], directOnCurrent: true, totalMeters: 0 };
+                    break;
+                }
             }
         }
         if (!chosen) {
@@ -947,7 +1250,7 @@ function advanceToNextLineStop(train) {
             // onTrainArrive. Teleport it straight onto the correct centred
             // position instead of trying to reason about which way to nudge
             // it from here.
-            if (bestRoute.edges.length === 0 && isTrainAtPlatform(train, chosen) && train.speedMs < 0.05) {
+            if (bestRoute.edges.length === 0 && isTrainAtPlatform(train, chosen) && train.speedMs < TRAIN_STOPPED_MS) {
                 snapTrainToPlatform(train, chosenTrack, chosen);
                 arrivalForward = train.headForward;
             }
@@ -955,52 +1258,109 @@ function advanceToNextLineStop(train) {
             train.route = bestRoute.edges;
             train.targetTrackId = chosen.track_id;
             train.targetDist = platformStopDist(train, chosenTrack, chosen, arrivalForward);
-            train.stopIndex = nextIndex;
+            train.targetForward = arrivalForward;
+            train.stopIndex = stopIndex;
             train.pendingStop = stop;
             train.pendingPlatformId = chosen.id;
             train.mode = 'line';
             train.dwellUntil = null;
 
             // Already sitting right at the stop point (zero distance left to
-            // travel) - enter dwell now rather than waiting on the physics
-            // loop, which only fires arrival on nonzero movement crossing a
-            // segment boundary.
-            if (train.headTrackId === train.targetTrackId && Math.abs(train.headDist - train.targetDist) < 1e-3) {
+            // travel) *and* actually stopped - enter dwell now rather than
+            // waiting on the physics loop, which only fires arrival on
+            // nonzero movement crossing a segment boundary. Requiring the
+            // train to be at (near) 0 km/h here too means a train that's
+            // merely passing through this exact point at speed (e.g. the
+            // zero-cost "already standing" match above was skipped because
+            // it was moving) never gets teleported into a dwell - it has to
+            // actually brake to a stop first, same as arriving normally.
+            if (train.speedMs < TRAIN_STOPPED_MS && train.headTrackId === train.targetTrackId && Math.abs(train.headDist - train.targetDist) < 1e-3) {
                 onTrainArrive(train);
             }
             return;
         }
-
-        if (attempt === 0 && train.speedMs < 0.05 && flipTrainHeadingInPlace(train)) continue;
-        break;
     }
 
     train.mode = 'idle';
-    showToast('No route to next stop for ' + train.label + '.');
+    showToast('No route to next stop for ' + train.label + ' - it may need a turnback to reverse.');
 }
 
-// Called when a line-assigned train's dwell elapses at the first or last
-// stop of its line. Rather than auto-reversing and continuing to shuttle,
-// the train is unassigned from the line and left idle at the platform,
-// awaiting a new line assignment or manual routing from the player.
-function stopTrainAtTerminus(train) {
-    let line = getLine(train.lineId);
-    train.lineId = null;
-    train.mode = 'idle';
-    train.route = [];
-    train.targetTrackId = null;
-    train.targetDist = null;
-    train.pendingStop = null;
-    train.pendingPlatformId = null;
+// Called when a line-assigned train's dwell elapses at the last stop of its
+// (one-way) line. Rather than shuttling back out stop-by-stop, the train
+// runs straight back to the first stop as a single non-revenue
+// repositioning move - it does not stop, dwell, or serve any of the stops
+// it happens to physically pass on the way back: a real one-way service
+// runs light back to its start, it doesn't pick up in the "wrong"
+// direction. Arriving back at the first stop is treated as a perfectly
+// ordinary stop arrival and normal forward service resumes from there.
+function startReturnToFirstStop(train, line) {
+    let stop0 = line.stops[0];
+    let plats = getStopPlatforms(stop0);
+    if (!plats.length) { train.mode = 'idle'; showToast('Line "' + line.name + '" has a stop with no platform.'); return; }
+
+    let overrideId = train.platformOverrides && train.platformOverrides[stop0.id];
+    let candidates = (overrideId && plats.some(p => p.id === overrideId)) ? plats.filter(p => p.id === overrideId) : plats;
+
+    let chosen = null, bestRoute = null, bestLen = Infinity;
+    if (train.speedMs < TRAIN_STOPPED_MS) {
+        for (let p of candidates) {
+            if (isTrainAtPlatform(train, p)) {
+                chosen = p; bestRoute = { edges: [], directOnCurrent: true, totalMeters: 0 };
+                break;
+            }
+        }
+    }
+    if (!chosen) {
+        for (let p of candidates) {
+            let t = getTrack(p.track_id);
+            if (!t) continue;
+            let route = computeTrainRoute(train, p.track_id, pxToMeters(t, p.t_dist));
+            if (route && route.totalMeters < bestLen) { bestLen = route.totalMeters; bestRoute = route; chosen = p; }
+        }
+    }
+    if (!chosen && candidates !== plats) {
+        for (let p of plats) {
+            let t = getTrack(p.track_id);
+            if (!t) continue;
+            let route = computeTrainRoute(train, p.track_id, pxToMeters(t, p.t_dist));
+            if (route && route.totalMeters < bestLen) { bestLen = route.totalMeters; bestRoute = route; chosen = p; }
+        }
+    }
+    if (!chosen) {
+        train.mode = 'idle';
+        showToast(train.label + ' has no route back to the start of ' + line.name + ' - it may need a turnback to reverse.');
+        return;
+    }
+
+    let chosenTrack = getTrack(chosen.track_id);
+    let arrivalForward = bestRoute.directOnCurrent ? train.headForward : bestRoute.edges[bestRoute.edges.length - 1].forward;
+    if (bestRoute.edges.length === 0 && isTrainAtPlatform(train, chosen) && train.speedMs < TRAIN_STOPPED_MS) {
+        snapTrainToPlatform(train, chosenTrack, chosen);
+        arrivalForward = train.headForward;
+    }
+
+    train.route = bestRoute.edges;
+    train.targetTrackId = chosen.track_id;
+    train.targetDist = platformStopDist(train, chosenTrack, chosen, arrivalForward);
+    train.targetForward = arrivalForward;
+    train.stopIndex = 0;
+    train.direction = 1;
+    train.pendingStop = stop0;
+    train.pendingPlatformId = chosen.id;
+    train.mode = 'line';
     train.dwellUntil = null;
-    train.platformOverrides = {};
-    train._lineJustAssigned = false;
-    train.color = NO_LINE_TRAIN_COLOR;
-    showToast(train.label + ' reached the end of ' + (line ? line.name : 'the line') + ' and is awaiting instructions.');
-    if (selectedTrainId === train.id) updateTrainPanel();
+
+    if (train.speedMs < TRAIN_STOPPED_MS && train.headTrackId === train.targetTrackId && Math.abs(train.headDist - train.targetDist) < 1e-3) {
+        onTrainArrive(train);
+    }
 }
 
 function assignLineToTrain(train, lineId) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to assign lines."); return; }
+        MP.sendInput({ type: 'ASSIGN_LINE', trainId: train.id, lineId: lineId || null });
+        return;
+    }
     train.lineId = lineId || null;
     train.platformOverrides = {};
     if (!lineId) {
@@ -1009,7 +1369,6 @@ function assignLineToTrain(train, lineId) {
         train.targetTrackId = null;
         train.targetDist = null;
         train.color = NO_LINE_TRAIN_COLOR;
-        train._lineJustAssigned = false;
         return;
     }
     let line = getLine(lineId);
@@ -1019,89 +1378,53 @@ function assignLineToTrain(train, lineId) {
         train.mode = 'idle';
         return;
     }
-    // Find the nearest reachable stop to start heading toward. Retry once
-    // with a physical turnback if nothing is reachable facing the way the
-    // train currently happens to be pointed (e.g. spawned facing away from
-    // the line in a dead-end depot).
-    let bestIdx = -1, bestRoute = null, bestPlat = null, bestLen = Infinity, bestDir = 1;
+    // A one-way line always starts service from its first stop, no matter
+    // where the train happens to be sitting right now - so getting there is
+    // exactly the same non-stop repositioning move as the automatic run
+    // back to the start at the end of a lap (see startReturnToFirstStop):
+    // it does not stop, dwell, or board at any other stop it happens to
+    // pass on the way.
+    startReturnToFirstStop(train, line);
+    if (train.mode === 'line') showToast(train.label + ' assigned to ' + line.name + '.');
+}
 
-    // Prefer a platform the train is already standing at, if the line
-    // serves one - see isTrainAtPlatform() for why this has to be checked
-    // explicitly rather than trusting computeTrainRoute's distance for it.
-    line.stops.forEach((stop, idx) => {
-        for (let p of getStopPlatforms(stop)) {
-            if (isTrainAtPlatform(train, p)) {
-                bestIdx = idx; bestPlat = p; bestLen = 0;
-                bestRoute = { edges: [], directOnCurrent: true, totalMeters: 0 };
-                bestDir = (idx === line.stops.length - 1) ? -1 : 1;
-            }
-        }
-    });
+// Recomputes the live manual-route preview for whatever's under the cursor
+// while a train is armed for manual routing. Mirrors exactly what a click
+// at (wx, wy) would do in handleCanvasClick's manual-route branch (same
+// nearest-track-point search, same 40px snap radius, same pathfinder), but
+// only ever writes to manualRoutePreview - it never touches the train's
+// actual route/target, so hovering around has zero effect on navigation
+// until the player actually clicks.
+function updateManualRoutePreview(wx, wy) {
+    let train = trains.find(t => t.id === manualRouteArmedTrainId);
+    if (!train) { manualRoutePreview = null; return; }
 
-    if (bestIdx === -1) {
-        for (let attempt = 0; attempt < 2; attempt++) {
-            line.stops.forEach((stop, idx) => {
-                for (let p of getStopPlatforms(stop)) {
-                    let t = getTrack(p.track_id);
-                    if (!t) continue;
-                    let route = computeTrainRoute(train, p.track_id, pxToMeters(t, p.t_dist));
-                    if (route && route.totalMeters < bestLen) {
-                        bestLen = route.totalMeters; bestRoute = route; bestPlat = p; bestIdx = idx;
-                        bestDir = (idx === line.stops.length - 1) ? -1 : 1;
-                    }
-                }
-            });
-            if (bestIdx !== -1) break;
-            if (attempt === 0 && train.speedMs < 0.05 && flipTrainHeadingInPlace(train)) continue;
-            break;
-        }
-    }
-    if (bestIdx === -1) {
-        showToast('No reachable stop on that line from here.');
-        train.mode = 'idle';
+    let hit = getNearestTrackPoint(wx, wy, null);
+    if (!hit || hit.dist >= 40) {
+        manualRoutePreview = { points: [], target: null, valid: false };
         return;
     }
-    let bestPlatTrack = getTrack(bestPlat.track_id);
-    let bestArrivalForward = bestRoute.directOnCurrent ? train.headForward : bestRoute.edges[bestRoute.edges.length - 1].forward;
 
-    // The train is already standing on this platform's segment right now
-    // (the isTrainAtPlatform zero-cost match above) - this covers both a
-    // single-platform start station and a multi-platform one where the
-    // train happens to be sitting on one of the serving platforms (its
-    // occupied footprint overlaps the marker, whether via its head, its
-    // tail, or somewhere in between). Rather than trying to drive the last
-    // stretch there - which can get stuck if the head has overshot the
-    // ideal point, or is facing the wrong way to reach it - teleport it
-    // straight onto the correct centred position and treat it as arrived.
-    if (bestRoute.edges.length === 0 && isTrainAtPlatform(train, bestPlat) && train.speedMs < 0.05) {
-        snapTrainToPlatform(train, bestPlatTrack, bestPlat);
-        bestArrivalForward = train.headForward;
+    let distM = pxToMeters(hit.track, hit.t_px);
+    let route = computeTrainRoute(train, hit.track.id, distM);
+    if (!route) {
+        manualRoutePreview = { points: [], target: { x: hit.x, y: hit.y }, valid: false };
+        return;
     }
 
-    train.route = bestRoute.edges;
-    train.targetTrackId = bestPlat.track_id;
-    train.targetDist = platformStopDist(train, bestPlatTrack, bestPlat, bestArrivalForward);
-    train.stopIndex = bestIdx;
-    train.direction = bestDir;
-    train.pendingStop = line.stops[bestIdx];
-    train.pendingPlatformId = bestPlat.id;
-    train.mode = 'line';
-    train.dwellUntil = null;
-    // The train's very first stop after being assigned may itself be the
-    // first/last stop on the line (e.g. it started right next to it) - that
-    // shouldn't count as "reached the end of the line", only as its
-    // starting point, so suppress the terminus check for this one stop.
-    train._lineJustAssigned = true;
-    showToast(train.label + ' assigned to ' + line.name + '.');
-
-    // Already sitting right at the stop point (zero distance left to
-    // travel, e.g. the auto-reverse above just snapped it into place) -
-    // enter dwell immediately rather than waiting on the physics loop,
-    // which only fires arrival on nonzero movement crossing a segment
-    // boundary.
-    if (train.headTrackId === train.targetTrackId && Math.abs(train.headDist - train.targetDist) < 1e-3) {
-        onTrainArrive(train);
-    }
+    // A lightweight virtual train sharing the real train's current
+    // position/heading - getTrainPathPoints only reads head*/route/target
+    // fields, so this reuses the exact same polyline logic as the
+    // committed-route overlay without ever mutating the real train.
+    let virtualTrain = {
+        headTrackId: train.headTrackId,
+        headForward: train.headForward,
+        headDist: train.headDist,
+        route: route.edges,
+        targetTrackId: hit.track.id,
+        targetDist: distM
+    };
+    manualRoutePreview = { points: getTrainPathPoints(virtualTrain), target: { x: hit.x, y: hit.y }, valid: true };
 }
 
 function setManualTarget(train, trackId, distM) {
@@ -1110,6 +1433,7 @@ function setManualTarget(train, trackId, distM) {
     train.route = route.edges;
     train.targetTrackId = trackId;
     train.targetDist = distM;
+    train.targetForward = route.directOnCurrent ? train.headForward : route.edges[route.edges.length - 1].forward;
     train.mode = 'manual';
     train.pendingStop = null;
     train.dwellUntil = null;
@@ -1149,17 +1473,50 @@ function flipTrainHeadingInPlace(train) {
 }
 
 function reverseTrain(train) {
-    if (train.speedMs > 0.05) { showToast('Train must be stopped to reverse.'); return; }
+    if (train.speedMs > TRAIN_STOPPED_MS) { showToast('Train must be stopped to reverse.'); return; }
+
+    // The player can now reverse anywhere, not just at a flagged turnback
+    // or the train's own depot - but doing so outside one of those proper
+    // reversing facilities leaves the train crawling at
+    // REVERSE_PENALTY_SPEED_KMH afterward (a rough, unauthorized reversal),
+    // until it reverses again (anywhere), which clears the restriction back
+    // to normal. Evaluated on the track the train is standing on *before*
+    // the flip - that's the physical location the reversal is happening at.
+    let properArea = canReverseInPlace(train);
+
+    // Being able to physically reverse in place doesn't mean it has to
+    // unassign the train from its line - a stopped train can turn around
+    // and keep working its service. What matters is not disturbing its
+    // service *progress* (stopIndex/pendingStop/dwell) while doing it:
+    let wasMidRoute = train.mode === 'line' && train.dwellUntil == null;
+    let wasDwelling = train.mode === 'line' && train.dwellUntil != null;
+    let line = wasMidRoute ? getLine(train.lineId) : null;
+    let stopIndex = train.stopIndex, pendingStop = train.pendingStop;
+
     if (!flipTrainHeadingInPlace(train)) return;
-    train.direction *= -1;
-    if (train.mode === 'line' && train.lineId) {
-        advanceToNextLineStop(train);
+
+    if (!properArea) train.reversePenaltyActive = !train.reversePenaltyActive;
+
+    if (wasMidRoute && line) {
+        // Mid-route (e.g. held at a red signal) - re-path to the exact same
+        // stop it was already heading to, from its new heading. This does
+        // NOT advance stopIndex or touch pendingStop, so the line and its
+        // progress are untouched - only the physical route to get there is
+        // recomputed.
+        train.mode = 'line';
+        routeTrainToLineStop(train, line, stopIndex, pendingStop);
+    } else if (wasDwelling) {
+        // Already arrived and sitting in its dwell - flipping here is
+        // purely cosmetic (re-aims it for its next departure) and must not
+        // restart or otherwise touch the running dwell timer.
+        train.mode = 'line';
     } else {
+        train.direction *= -1;
         train.mode = 'idle';
         train.targetTrackId = null;
         train.targetDist = null;
     }
-    showToast(train.label + ' reversed.');
+    showToast(train.label + ' reversed.' + (!properArea ? (train.reversePenaltyActive ? (' Unauthorized reversal - capped at ' + REVERSE_PENALTY_SPEED_KMH + ' km/h until it reverses again.') : ' Speed restriction cleared.') : ''));
 }
 
 function toggleEmergencyBrake(train) {
@@ -1221,6 +1578,17 @@ function platformWaiting(plat) {
 
 function simulatePassengers(dtSimSeconds) {
     if (!state.demand || !state.demand.groups || dtSimSeconds <= 0) return;
+
+    // Periodically check for (and fix) passengers stranded on the wrong
+    // platform - see rebalancePlatformWaiting(). Throttled since it's a
+    // full station/destination sweep, not something that needs to run
+    // every single frame.
+    _platformRebalanceAcc += dtSimSeconds;
+    if (_platformRebalanceAcc >= PLATFORM_REBALANCE_INTERVAL_S) {
+        _platformRebalanceAcc = 0;
+        rebalancePlatformWaiting();
+    }
+
     // Cache which platforms serve a given destination per station, reused
     // across every group/station this tick - the underlying lines/platforms
     // don't change mid-tick, so there's no need to recompute it per spawn.
@@ -1307,6 +1675,60 @@ function platformsServingDestination(plats, destCode) {
     return serving.length ? serving : plats;
 }
 
+// How often (in simulated seconds) to sweep every multi-platform station and
+// check whether anyone already waiting is stuck on a platform that no longer
+// actually serves their destination. platformsServingDestination() only
+// picks the *right* platform for a passenger at the moment they spawn - if
+// the situation changes afterward (a platform override is set/cleared, a
+// line is edited or reassigned, a new line opens up a shortcut, etc.) a
+// passenger who already spawned keeps waiting exactly where they first
+// appeared, since normal boarding only ever pulls from the one platform a
+// train actually docks at (see handleStopArrival). Without this sweep those
+// passengers would simply wait forever. This is what let players see
+// passengers "go missing" / never board despite a train stopping right at
+// their station - they were on the wrong platform for it.
+const PLATFORM_REBALANCE_INTERVAL_S = 5;
+let _platformRebalanceAcc = 0;
+
+// Moves any waiting passengers off a platform that no longer serves their
+// destination onto one at the same station that does - i.e. lets waiting
+// passengers switch platforms when needed, the same way a real passenger
+// would walk to a different platform if they realized they were on the
+// wrong one.
+function rebalancePlatformWaiting() {
+    let byStation = {};
+    for (let p of state.platforms) {
+        if (!p.stationCode) continue;
+        (byStation[p.stationCode] = byStation[p.stationCode] || []).push(p);
+    }
+    let servingCache = {};
+    for (let stationCode in byStation) {
+        let plats = byStation[stationCode];
+        if (plats.length < 2) continue; // only one platform here - nowhere else to move to
+        for (let p of plats) {
+            let waiting = p._waiting;
+            if (!waiting) continue;
+            for (let destCode of Object.keys(waiting)) {
+                let count = waiting[destCode];
+                if (!(count > 0)) continue;
+                let cacheKey = stationCode + '|' + destCode;
+                let candidatePlats = servingCache[cacheKey];
+                if (!candidatePlats) {
+                    candidatePlats = platformsServingDestination(plats, destCode);
+                    servingCache[cacheKey] = candidatePlats;
+                }
+                if (candidatePlats.includes(p)) continue; // already waiting somewhere that works
+                // This platform doesn't actually go toward destCode (anymore) -
+                // move the whole bucket over to one that does.
+                delete waiting[destCode];
+                let target = candidatePlats[Math.floor(Math.random() * candidatePlats.length)];
+                let targetWaiting = platformWaiting(target);
+                targetWaiting[destCode] = (targetWaiting[destCode] || 0) + count;
+            }
+        }
+    }
+}
+
 // Builds an unweighted "can ride directly" graph between station codes: an
 // edge between two stations exists if some line calls at both of them (so
 // riding that one line, with no transfer, gets you from one to the other).
@@ -1378,15 +1800,18 @@ function lineHelpsTowardDestination(line, fromStationCode, destCode) {
 }
 
 function handleStopArrival(train, stop) {
-    let stationCodes = new Set(getStopPlatforms(stop).map(p => p.stationCode).filter(Boolean));
+    let stopPlatforms = getStopPlatforms(stop);
+    let stationCodes = new Set(stopPlatforms.map(p => p.stationCode).filter(Boolean));
 
-    // At a terminus (the first or last stop on the line) the train is about
-    // to reverse and start its return trip - everyone on board has to get
-    // off here regardless of where they're actually headed, exactly like a
-    // real train emptying out at the end of the line, rather than only the
-    // handful whose destination happens to be this exact station.
+    // A one-way line only truly ends at its last stop - everyone on board
+    // has to get off there regardless of where they're actually headed,
+    // exactly like a real train emptying out at the end of the line, rather
+    // than only the handful whose destination happens to be this exact
+    // station. The first stop isn't a terminus in this sense: the train
+    // arrives there empty anyway (see startReturnToFirstStop), it's just
+    // the ordinary start of the next forward run.
     let line = getLine(train.lineId);
-    let isTerminus = !!(line && line.stops && (train.stopIndex === 0 || train.stopIndex === line.stops.length - 1));
+    let isTerminus = !!(line && line.stops && train.stopIndex === line.stops.length - 1);
 
     // Alight.
     let alighted = 0;
@@ -1396,31 +1821,46 @@ function handleStopArrival(train, stop) {
     });
     train.passengerCount = Math.max(0, train.passengerCount - alighted);
 
-    // Board, from the platform this train actually docked at. Passengers
-    // only get on if this line is actually useful to them - either it goes
-    // straight to their destination, or it reaches an interchange station
-    // that's a genuine step closer (fewer further line-rides needed) than
-    // waiting here does. Otherwise they'd be boarding a train that can never
-    // get them anywhere nearer to where they're going.
+    // Board, from every platform belonging to this stop - not just the one
+    // this train physically happens to be docked at. A stop can list more
+    // than one platform precisely because a train might use either one from
+    // visit to visit (a terminus with two platforms and no fixed
+    // arrival/departure split, an override, etc) - a passenger who was
+    // waiting on the platform the train *isn't* using this time is still,
+    // for all practical purposes, standing at the same stop the train just
+    // pulled into, and walks over to board rather than missing it. This is
+    // separate from rebalancePlatformWaiting(), which periodically fixes up
+    // passengers waiting on a platform that doesn't serve their destination
+    // at all - this instead handles "right platform for the stop, just not
+    // the specific one the train is using right now".
+    //
+    // Passengers only get on if this line is actually useful to them -
+    // either it goes straight to their destination, or it reaches an
+    // interchange station that's a genuine step closer (fewer further
+    // line-rides needed) than waiting here does. Otherwise they'd be
+    // boarding a train that can never get them anywhere nearer to where
+    // they're going.
     let boarded = 0;
     let plat = getPlatform(train.pendingPlatformId);
     if (plat && line) {
         let fromStationCode = plat.stationCode;
-        let waiting = platformWaiting(plat);
-        for (let destCode of Object.keys(waiting)) {
-            if (train.passengerCount >= train.capacity) break;
-            if (stationCodes.has(destCode)) continue; // already home, wouldn't have been waiting for this train anyway
-            if (!lineHelpsTowardDestination(line, fromStationCode, destCode)) continue;
-            let avail = waiting[destCode];
-            if (!(avail > 0)) continue;
-            let room = train.capacity - train.passengerCount;
-            let board = Math.min(avail, room);
-            waiting[destCode] -= board;
-            if (waiting[destCode] <= 0) delete waiting[destCode];
-            train.passengerCount += board;
-            boarded += board;
-            let existing = train.passengers.find(e => e.destCode === destCode);
-            if (existing) existing.count += board; else train.passengers.push({ destCode, count: board });
+        for (let srcPlat of stopPlatforms) {
+            let waiting = platformWaiting(srcPlat);
+            for (let destCode of Object.keys(waiting)) {
+                if (train.passengerCount >= train.capacity) break;
+                if (stationCodes.has(destCode)) continue; // already home, wouldn't have been waiting for this train anyway
+                if (!lineHelpsTowardDestination(line, fromStationCode, destCode)) continue;
+                let avail = waiting[destCode];
+                if (!(avail > 0)) continue;
+                let room = train.capacity - train.passengerCount;
+                let board = Math.min(avail, room);
+                waiting[destCode] -= board;
+                if (waiting[destCode] <= 0) delete waiting[destCode];
+                train.passengerCount += board;
+                boarded += board;
+                let existing = train.passengers.find(e => e.destCode === destCode);
+                if (existing) existing.count += board; else train.passengers.push({ destCode, count: board });
+            }
         }
     }
 
@@ -1760,6 +2200,14 @@ function draw() {
     // as a glowing line with light animated flowing along it toward the
     // target so it reads as "energized" rather than a static dashed guide.
     let nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    // Glow size and flow speed scale directly with zoom - zoomed in, the
+    // overlay reads as a bigger, faster-flowing beam; zoomed out it shrinks
+    // back down instead of staying a fixed screen size. shadowBlur/dash
+    // speed aren't affected by the canvas transform the way line widths
+    // are, so this has to be applied explicitly. Clamped so it never
+    // vanishes to nothing at extreme zoom-out or balloons into mush at
+    // extreme zoom-in.
+    let glowZoom = Math.max(0.5, Math.min(4, camera.zoom));
     for (let train of trains) {
         if (train.id !== selectedTrainId && train.id !== hoverTrainId) continue;
         let pts = getTrainPathPoints(train);
@@ -1784,13 +2232,13 @@ function draw() {
         // Soft outer glow (wide, blurred halo) in a high-contrast amber -
         // distinct from track/signal/train hues so it never blends in.
         ctx.shadowColor = '#f59e0b';
-        ctx.shadowBlur = 18;
+        ctx.shadowBlur = 18 * glowZoom;
         ctx.strokeStyle = 'rgba(245,158,11,0.55)';
         ctx.lineWidth = 7;
         ctx.stroke();
 
         // Bright core line on top of the glow.
-        ctx.shadowBlur = 10;
+        ctx.shadowBlur = 10 * glowZoom;
         ctx.strokeStyle = '#fef3c7';
         ctx.lineWidth = 2.5;
         ctx.stroke();
@@ -1805,17 +2253,93 @@ function draw() {
         ctx.moveTo(pts[0].x, pts[0].y);
         for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
         let dashLen = 16, gapLen = 26, period = dashLen + gapLen;
-        let flowSpeedPxPerSec = 90;
+        let flowSpeedPxPerSec = 90 * glowZoom;
         let offset = -((nowMs / 1000) * flowSpeedPxPerSec) % period;
         ctx.setLineDash([dashLen, gapLen]);
         ctx.lineDashOffset = offset;
         ctx.shadowColor = '#fff7ed';
-        ctx.shadowBlur = 10;
+        ctx.shadowBlur = 10 * glowZoom;
         ctx.strokeStyle = '#fff7ed';
         ctx.lineWidth = 2.5;
         ctx.globalAlpha = 0.95;
         ctx.stroke();
         ctx.restore();
+
+        // Further pathfind preview: the leg AFTER the current target, on to
+        // the following stop - dimmer and cooler-toned so it reads clearly
+        // as "what's next" rather than competing with the active leg above.
+        let nextPts = getTrainNextPathPoints(train);
+        if (nextPts.length >= 1) {
+            let full = [pts[pts.length - 1], ...nextPts];
+            if (full.length >= 2) {
+                ctx.save();
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+                ctx.moveTo(full[0].x, full[0].y);
+                for (let k = 1; k < full.length; k++) ctx.lineTo(full[k].x, full[k].y);
+                ctx.shadowColor = '#38bdf8';
+                ctx.shadowBlur = 9 * glowZoom;
+                ctx.strokeStyle = 'rgba(56,189,248,0.55)';
+                ctx.lineWidth = 4;
+                ctx.setLineDash([9, 10]);
+                ctx.lineDashOffset = -((nowMs / 1000) * 40 * glowZoom) % 19;
+                ctx.globalAlpha = 0.8;
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+    }
+
+    // 5c. Manual-route picking preview - the path the armed train would take
+    // to wherever the cursor currently is, drawn live as the pointer moves
+    // and before any click commits it. Distinct cool cyan styling (vs. the
+    // amber "committed route" overlay above) makes clear this is only a
+    // preview, plus a target ring at the exact snap point and a red "no
+    // route" marker when nothing legal is reachable from here.
+    if (manualRouteArmedTrainId && manualRoutePreview) {
+        let pts = manualRoutePreview.points;
+        if (manualRoutePreview.valid && pts.length >= 2) {
+            ctx.save();
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+
+            ctx.shadowBlur = 0;
+            ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+            ctx.lineWidth = 8;
+            ctx.stroke();
+
+            ctx.shadowColor = '#22d3ee';
+            ctx.shadowBlur = 14 * glowZoom;
+            ctx.strokeStyle = 'rgba(34,211,238,0.55)';
+            ctx.lineWidth = 6;
+            ctx.setLineDash([12, 10]);
+            ctx.lineDashOffset = -((nowMs / 1000) * 70 * glowZoom) % 22;
+            ctx.stroke();
+
+            ctx.shadowBlur = 8 * glowZoom;
+            ctx.strokeStyle = '#cffafe';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        if (manualRoutePreview.target) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(manualRoutePreview.target.x, manualRoutePreview.target.y, 8, 0, Math.PI * 2);
+            ctx.strokeStyle = manualRoutePreview.valid ? '#22d3ee' : '#ef4444';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(manualRoutePreview.target.x, manualRoutePreview.target.y, 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = manualRoutePreview.valid ? '#22d3ee' : '#ef4444';
+            ctx.fill();
+            ctx.restore();
+        }
     }
 
     // 6. Trains
@@ -1891,14 +2415,19 @@ function drawTrain(train) {
     // (small blur radius) so it doesn't overpower the pathfinding overlay
     // or make dense junctions look noisy.
     let bodyColor = (train.emergencyBrake || train.autoEmergencyBrake) ? '#ef4444' : (train.color || NO_LINE_TRAIN_COLOR);
+    // Glow size scales directly with zoom - shadowBlur is defined in device
+    // pixels regardless of the canvas' current scale transform, so without
+    // this a train's glow would stay a fixed size on screen no matter how
+    // far zoomed in. Clamped to keep it sane at extreme zoom levels.
+    let trainGlowZoom = Math.max(0.5, Math.min(4, camera.zoom));
     ctx.shadowColor = bodyColor;
-    ctx.shadowBlur = isSelected ? 10 : 7;
+    ctx.shadowBlur = (isSelected ? 10 : 7) * trainGlowZoom;
     ctx.lineWidth = isSelected ? TRAIN_LINE_WIDTH_SELECTED : TRAIN_LINE_WIDTH;
     ctx.strokeStyle = bodyColor;
     ctx.stroke();
     // A second pass deepens the glow without over-brightening the core line
     // itself (shadowBlur stacks visually more than the core stroke alpha).
-    ctx.shadowBlur = isSelected ? 16 : 12;
+    ctx.shadowBlur = (isSelected ? 16 : 12) * trainGlowZoom;
     ctx.stroke();
     ctx.shadowBlur = 0;
     ctx.restore();
@@ -1939,11 +2468,47 @@ function drawTrain(train) {
     ctx.stroke();
     ctx.restore();
 
+    // Passenger/capacity occupancy bar - a small fill gauge hovering just
+    // above the train, always drawn (not only when selected/hovered) so
+    // crowding is visible across the whole map at a glance. Scales inversely
+    // with zoom like the text labels, so it stays a legible, constant size
+    // on screen rather than shrinking away when zoomed out.
+    {
+        let barScale = Math.max(0.6, Math.min(2.2, 1 / camera.zoom));
+        let barW = 34 * barScale, barH = 5 * barScale;
+        let bx = headPt.x - barW / 2;
+        let by = headPt.y - 32 * barScale;
+        let cap = train.capacity > 0 ? train.capacity : DEFAULT_TRAIN_CAPACITY;
+        let frac = Math.max(0, Math.min(1, train.passengerCount / cap));
+        let fillColor = frac >= 0.9 ? '#ef4444' : (frac >= 0.65 ? '#f59e0b' : '#4ade80');
+        ctx.save();
+        drawRoundedRect(ctx, bx, by, barW, barH, barH / 2);
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.fill();
+        if (frac > 0) {
+            let fillW = Math.max(barH, barW * frac);
+            drawRoundedRect(ctx, bx, by, fillW, barH, barH / 2);
+            ctx.fillStyle = fillColor;
+            ctx.fill();
+        }
+        ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+        ctx.lineWidth = 1;
+        drawRoundedRect(ctx, bx, by, barW, barH, barH / 2);
+        ctx.stroke();
+        ctx.restore();
+    }
+
     // Active speed-limit ("temporary speed restriction") sign - drawn like a
     // real lineside speed sign (white disc, red ring, black number) right
     // next to the head, so a capped train is obviously flagged at a glance
-    // instead of the limit being buried in the side panel text.
-    if (train.speedCapKmh != null) {
+    // instead of the limit being buried in the side panel text. Combines the
+    // player-set speed cap with the post-reversal penalty cap, whichever is
+    // lower, since either (or both) can be active at once.
+    let displayCapKmh = train.speedCapKmh;
+    if (train.reversePenaltyActive) {
+        displayCapKmh = (displayCapKmh != null) ? Math.min(displayCapKmh, REVERSE_PENALTY_SPEED_KMH) : REVERSE_PENALTY_SPEED_KMH;
+    }
+    if (displayCapKmh != null) {
         let signScale = Math.max(0.7, Math.min(1.8, 1 / camera.zoom));
         let signR = 11 * signScale;
         let sx = headPt.x + hdy * (18 * signScale);
@@ -1961,18 +2526,29 @@ function drawTrain(train) {
         ctx.font = 'bold ' + Math.round(signR * 0.95) + 'px sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(String(Math.round(train.speedCapKmh)), 0, signR * 0.05);
+        ctx.fillText(String(Math.round(displayCapKmh)), 0, signR * 0.05);
         ctx.restore();
     }
 
     ctx.save();
     let labelScale = Math.max(0.6, Math.min(2.4, 1 / camera.zoom));
     ctx.font = (12 * labelScale) + 'px sans-serif';
-    ctx.textAlign = 'center';
+    ctx.textAlign = 'left';
     ctx.textBaseline = 'bottom';
+    let prefix = train.label + ' \u00B7 ' + nextStationLabel(train) + ' \u00B7 ';
+    let speedText = formatSpeedLabel(train);
+    let totalWidth = ctx.measureText(prefix + speedText).width;
+    let startX = headPt.x - totalWidth / 2;
+    let ly = headPt.y - 10 * labelScale;
     ctx.fillStyle = '#f4f4f5';
-    let text = train.label + ' \u00B7 ' + nextStationLabel(train) + ' \u00B7 ' + formatSpeedLabel(train);
-    ctx.fillText(text, headPt.x, headPt.y - 10 * labelScale);
+    ctx.fillText(prefix, startX, ly);
+    // While the emergency brake is on (manual or signal-triggered), the
+    // speed portion of the label blinks red so it's obvious at a glance
+    // from anywhere on the map, not just from the selected train's panel.
+    let eb = train.emergencyBrake || train.autoEmergencyBrake;
+    let blinkOn = !eb || Math.floor(performance.now() / 500) % 2 === 0;
+    ctx.fillStyle = (eb && blinkOn) ? '#ef4444' : '#f4f4f5';
+    ctx.fillText(speedText, startX + ctx.measureText(prefix).width, ly);
     ctx.restore();
 
     // Alight/board counter - shown only while actually dwelling at a stop,
@@ -1985,7 +2561,7 @@ function drawTrain(train) {
         ctx.font = 'bold ' + (11 * cScale) + 'px sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'bottom';
-        let cy = headPt.y - (10 + 15) * labelScale;
+        let cy = headPt.y - (10 + 15 + 12) * labelScale;
         let parts = [];
         if (train.lastAlighted) parts.push({ text: '\u2212' + train.lastAlighted, color: '#f87171' });
         if (train.lastBoarded) parts.push({ text: '+' + train.lastBoarded, color: '#4ade80' });
@@ -2179,6 +2755,16 @@ canvas.addEventListener('pointermove', (e) => {
     let changed = false;
     if (hit !== hoverSignal) { hoverSignal = hit; changed = true; }
     if (trainHitId !== hoverTrainId) { hoverTrainId = trainHitId; changed = true; }
+
+    // Manual-route picking mode: recompute the live path preview under the
+    // cursor on every move (not just when the hovered signal/train
+    // changes), since the preview target slides continuously along
+    // whatever track is nearest the pointer.
+    if (manualRouteArmedTrainId) {
+        updateManualRoutePreview(wPos.x, wPos.y);
+        changed = true;
+    }
+
     if (changed) {
         canvas.style.cursor = hit ? 'pointer' : (manualRouteArmedTrainId ? 'crosshair' : (trainHit ? 'pointer' : 'grab'));
         draw();
@@ -2217,6 +2803,7 @@ function handleCanvasClick(sx, sy, clientX, clientY) {
     if (manualRouteArmedTrainId) {
         let train = trains.find(t => t.id === manualRouteArmedTrainId);
         manualRouteArmedTrainId = null;
+        manualRoutePreview = null;
         setHint(defaultHint());
         if (!train) { draw(); return; }
         let hit = getNearestTrackPoint(wPos.x, wPos.y, null);
@@ -2257,9 +2844,10 @@ canvas.addEventListener('pointerup', endPan);
 canvas.addEventListener('pointercancel', endPan);
 canvas.addEventListener('pointerleave', () => {
     if (isPanning) return;
-    if (hoverSignal || hoverTrainId) {
+    if (hoverSignal || hoverTrainId || (manualRouteArmedTrainId && manualRoutePreview)) {
         hoverSignal = null;
         hoverTrainId = null;
+        if (manualRouteArmedTrainId) manualRoutePreview = null;
         draw();
     }
 });
@@ -2319,6 +2907,19 @@ function simTick(now) {
     lastFrameTime = now;
     dtSeconds = Math.min(dtSeconds, 0.25);
 
+    // Multiplayer client: the host is the only machine that runs physics.
+    // We just keep pinging the host and render whatever state snapshot it
+    // last sent us (applied directly to `trains`/`state.signals` as it
+    // arrives - see MP.applySnapshot in net.js), so there's nothing to
+    // step here.
+    if (window.MP && MP.active && !MP.isHost) {
+        MP.clientTick(now);
+        if (selectedTrainId) updateTrainPanel();
+        draw();
+        requestAnimationFrame(simTick);
+        return;
+    }
+
     if (!simPaused && !gameOver) {
         let simDt = dtSeconds * simSpeed;
         simTimeSeconds += simDt;
@@ -2330,15 +2931,23 @@ function simTick(now) {
                 train.dwellUntil = null;
                 if (train.lineId) {
                     let line = getLine(train.lineId);
-                    let atTerminus = line && Array.isArray(line.stops) &&
-                        (train.stopIndex === 0 || train.stopIndex === line.stops.length - 1);
-                    if (atTerminus && !train._lineJustAssigned) {
-                        // Reached the end of the line - stop here and wait for
-                        // the player rather than auto-reversing and shuttling
-                        // back out on its own.
-                        stopTrainAtTerminus(train);
+                    let atLastStop = line && Array.isArray(line.stops) && train.stopIndex === line.stops.length - 1;
+                    if (atLastStop) {
+                        // One-way line: reaching the last stop ends this
+                        // train's assignment to the line rather than looping
+                        // it back for another run on its own - a line
+                        // terminates here, it doesn't automatically turn
+                        // into a fresh non-revenue trip across the map back
+                        // to stop 0 (that long, unattended repositioning
+                        // move was also the easiest way to end up asking the
+                        // pathfinder for an awkward route that doubled back
+                        // on itself). The train just sits here, unassigned,
+                        // until the player gives it a new line or routes it
+                        // manually.
+                        let lineName = line.name;
+                        assignLineToTrain(train, null);
+                        showToast(train.label + ' reached the end of ' + lineName + ' and is now unassigned.');
                     } else {
-                        train._lineJustAssigned = false;
                         advanceToNextLineStop(train);
                     }
                 } else {
@@ -2365,7 +2974,12 @@ function simTick(now) {
 
         simulatePassengers(simDt);
 
-        if (checkCollisions()) { draw(); requestAnimationFrame(simTick); return; }
+        if (checkCollisions()) {
+            if (window.MP && MP.active && MP.isHost) MP.hostTick(now);
+            draw();
+            requestAnimationFrame(simTick);
+            return;
+        }
 
         if (selectedTrainId) updateTrainPanel();
     } else {
@@ -2375,18 +2989,60 @@ function simTick(now) {
         for (let train of trains) { train._occ = getOccupiedEdges(train); }
     }
 
+    if (window.MP && MP.active && MP.isHost) MP.hostTick(now);
+
     draw();
     requestAnimationFrame(simTick);
 }
 
-document.getElementById('btn-pause').addEventListener('click', () => setPaused(!simPaused));
+document.getElementById('btn-pause').addEventListener('click', () => {
+    // In multiplayer, only the host's clock actually runs - a non-host
+    // client's pause button would have nothing to control locally.
+    if (window.MP && MP.active && !MP.isHost) return;
+    setPaused(!simPaused);
+});
 
 const speedSlider = document.getElementById('speed-slider');
 const speedLabel = document.getElementById('speed-label');
-speedSlider.addEventListener('input', () => {
-    simSpeed = parseInt(speedSlider.value, 10);
+
+// Shared entry point for every way time warp can be changed (slider, +/-
+// buttons, or a network SET_TIME_WARP request already validated by the
+// host). In multiplayer this is the ONE place that decides whether a
+// change is allowed to happen locally or has to be asked of the host.
+function requestTimeWarp(newValue) {
+    newValue = Math.max(1, Math.min(60, Math.round(newValue)));
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('timeWarp')) {
+            showToast("You don't have permission to change time warp.");
+            speedSlider.value = simSpeed;
+            speedLabel.textContent = simSpeed + 'x';
+            return;
+        }
+        let cap = MP.myTimeWarpCap();
+        if (cap != null) newValue = Math.min(newValue, cap);
+        speedSlider.value = newValue; // optimistic UI; host confirms via TIME_WARP_UPDATE
+        speedLabel.textContent = newValue + 'x';
+        MP.sendInput({ type: 'SET_TIME_WARP', value: newValue });
+        return;
+    }
+    applyTimeWarpLocal(newValue);
+}
+
+// Actually mutates simSpeed. Only ever called on the host or in
+// singleplayer - never directly by a non-host client (see above).
+function applyTimeWarpLocal(newValue) {
+    simSpeed = Math.max(1, Math.min(60, Math.round(newValue)));
+    speedSlider.value = simSpeed;
     speedLabel.textContent = simSpeed + 'x';
-});
+    if (window.MP && MP.active && MP.isHost) MP.broadcastTimeWarp(simSpeed);
+}
+
+speedSlider.addEventListener('input', () => requestTimeWarp(parseInt(speedSlider.value, 10)));
+
+const warpMinusBtn = document.getElementById('warp-minus');
+const warpPlusBtn = document.getElementById('warp-plus');
+if (warpMinusBtn) warpMinusBtn.addEventListener('click', () => requestTimeWarp(simSpeed - 1));
+if (warpPlusBtn) warpPlusBtn.addEventListener('click', () => requestTimeWarp(simSpeed + 1));
 
 updateClockDisplay();
 setPaused(true);
@@ -2469,9 +3125,21 @@ function updateTrainPanel() {
     else if (train.mode === 'idle') { pill.className = 'status-pill'; pill.textContent = 'Idle'; }
     else { pill.className = 'status-pill ok'; pill.textContent = train.mode === 'manual' ? 'Manual route' : 'In service'; }
     statusEl.appendChild(pill);
+    if (train.reversePenaltyActive) {
+        let penaltyPill = document.createElement('span');
+        penaltyPill.className = 'status-pill brake';
+        penaltyPill.textContent = 'Reverse limited \u00B7 ' + REVERSE_PENALTY_SPEED_KMH + ' km/h';
+        statusEl.appendChild(penaltyPill);
+    }
 
-    document.getElementById('tp-speed').textContent = formatSpeedLabel(train) +
-        (train.speedCapKmh != null ? (' (limit ' + train.speedCapKmh + ' km/h)') : '');
+    let speedEl = document.getElementById('tp-speed');
+    let displayCapKmh = train.speedCapKmh;
+    if (train.reversePenaltyActive) {
+        displayCapKmh = (displayCapKmh != null) ? Math.min(displayCapKmh, REVERSE_PENALTY_SPEED_KMH) : REVERSE_PENALTY_SPEED_KMH;
+    }
+    speedEl.textContent = formatSpeedLabel(train) +
+        (displayCapKmh != null ? (' (limit ' + displayCapKmh + ' km/h)') : '');
+    speedEl.classList.toggle('speed-eb-flash', !!(train.emergencyBrake || train.autoEmergencyBrake));
     document.getElementById('tp-next').textContent = nextStationLabel(train);
 
     let lineSelect = document.getElementById('tp-line-select');
@@ -2505,6 +3173,7 @@ function updateTrainPanel() {
     document.getElementById('tp-pax-fill').style.width = Math.min(100, (train.passengerCount / train.capacity) * 100) + '%';
 
     document.getElementById('tp-brake').textContent = train.emergencyBrake ? 'Release Brake' : 'Emergency Brake';
+    document.getElementById('tp-reverse').disabled = train.speedMs > TRAIN_STOPPED_MS;
     document.getElementById('tp-despawn').style.display = isTrainFullyInHomeDepot(train) ? '' : 'none';
 }
 
@@ -2541,6 +3210,7 @@ document.getElementById('tp-platform-select').addEventListener('change', (e) => 
     train.route = route.edges;
     train.targetTrackId = plat.track_id;
     train.targetDist = platformStopDist(train, track, plat, arrivalForward);
+    train.targetForward = arrivalForward;
     train.pendingPlatformId = plat.id;
 
     // Passengers already waiting on the platform this stop used to point at
@@ -2624,6 +3294,7 @@ document.getElementById('tp-despawn').addEventListener('click', () => {
 
 function armManualRoute(train) {
     manualRouteArmedTrainId = train.id;
+    manualRoutePreview = null;
     setHint('Click anywhere on a track to route ' + train.label + ' there \u00B7 click here to cancel');
     canvas.style.cursor = 'crosshair';
 }
@@ -2682,7 +3353,7 @@ function openContextMenu(train, clientX, clientY) {
     ctxMenuTrainId = train.id;
     document.getElementById('ctx-title').textContent = train.label;
     document.getElementById('ctx-brake').textContent = train.emergencyBrake ? 'Release emergency brake' : 'Emergency brake';
-    document.getElementById('ctx-reverse').disabled = train.speedMs > 0.05;
+    document.getElementById('ctx-reverse').disabled = train.speedMs > TRAIN_STOPPED_MS;
     document.getElementById('ctx-despawn').style.display = isTrainFullyInHomeDepot(train) ? '' : 'none';
 
     ctxMenu.classList.add('open');
@@ -2756,6 +3427,15 @@ function loadDiagram(parsed) {
 
     state.signals.forEach(s => {
         if (s.state !== 'blue' && s.state !== 'red') s.state = 'red';
+        // A signal's direction (1 or -1) is what makes it apply to a train
+        // at all - see the `matches` check in gatherLookahead. A signal
+        // missing this field (or holding some other stray value) matches
+        // neither forward nor backward travel, which makes it a permanent
+        // no-op: it can sit there showing red forever and simply never stop
+        // any train that passes it, regardless of colour. Default it the
+        // same way `state` is defaulted just above, rather than leaving a
+        // signal that can visually never protect anything.
+        if (s.direction !== 1 && s.direction !== -1) s.direction = 1;
     });
     state.platforms.forEach(p => { p._waiting = {}; });
 
@@ -2763,6 +3443,7 @@ function loadDiagram(parsed) {
     nextTrainSeq = 1;
     selectedTrainId = null;
     manualRouteArmedTrainId = null;
+    manualRoutePreview = null;
     gameOver = false;
     crashAnim = null;
     document.getElementById('gameover-overlay').classList.add('hidden');
@@ -2778,6 +3459,11 @@ function loadDiagram(parsed) {
     updateClockDisplay();
 
     draw();
+
+    // Let other listeners (e.g. the multiplayer host-setup screen in
+    // net.js) know a diagram is now available, without net.js needing to
+    // know anything about how loadDiagram works internally.
+    window.dispatchEvent(new Event('diagram-loaded'));
 }
 
 function handleImportFile(file) {

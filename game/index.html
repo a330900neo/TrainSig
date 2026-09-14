@@ -104,6 +104,12 @@
     background: rgba(59,130,246,0.12);
   }
 
+  .btn:disabled{
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+
   .btn-primary{
     background: var(--accent);
     border-color: var(--accent);
@@ -283,7 +289,7 @@
     font-size: 13px;
     padding: 8px 14px;
     border-radius: 8px;
-    z-index: 6;
+    z-index: 30;
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.2s, transform 0.2s;
@@ -505,6 +511,241 @@
     line-height: 1.5;
     margin: 0 0 20px 0;
   }
+
+  .hidden{ display: none !important; }
+
+  /* --- Time warp +/- buttons --- */
+  .warp-btn{
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    flex: none;
+  }
+  .warp-btn:hover:not(:disabled){ border-color: var(--accent); background: rgba(59,130,246,0.12); }
+  .warp-btn:disabled{ opacity: 0.35; cursor: not-allowed; }
+
+  /* --- Multiplayer overlay (menu / lobby) --- */
+  .mp-overlay{
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at 50% 30%, #1c1c21 0%, var(--bg) 70%);
+  }
+  .mp-card{
+    width: 340px;
+    max-width: 90vw;
+    max-height: 86vh;
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 26px;
+  }
+  .mp-card-wide{ width: 420px; }
+  .mp-card h1{
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 20px;
+    margin: 0 0 6px 0;
+  }
+  .mp-card > p{ color: var(--muted); font-size: 13px; margin: 0 0 18px 0; line-height: 1.5; }
+  .mp-card .btn{ margin-bottom: 8px; }
+  .mp-card .btn-row .btn{ margin-bottom: 0; }
+  .mp-field-label{
+    display:block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 12px 0 6px 0;
+  }
+  .mp-check{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text);
+    margin: 10px 0 16px 0;
+    cursor: pointer;
+  }
+  .mp-hint{ color: var(--muted); font-size: 12px; margin-top: 14px; line-height: 1.5; }
+
+  .mp-mapstatus-row{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+    font-size: 13px;
+  }
+  .mp-mapstatus-row span{ color: var(--muted); flex: 1; }
+  .mp-mapstatus-row span.ok{ color: var(--text); }
+  .mp-mapstatus-row .btn{ margin-bottom: 0; flex: none; }
+
+  .mp-roomcode-row{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: var(--muted);
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .mp-roomcode{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: 18px;
+    letter-spacing: 0.12em;
+    color: var(--text);
+  }
+
+  .mp-player-list{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 320px;
+    overflow-y: auto;
+    margin-bottom: 16px;
+  }
+  .mp-player-row{
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+  .mp-player-row-top{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .mp-player-name{ font-weight: 600; display:flex; align-items:center; gap:6px; }
+  .mp-host-tag{
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .mp-ping{
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+  }
+  .mp-ping.good{ color: #bbf7d0; border-color: var(--ok); }
+  .mp-ping.ok{ color: #fde68a; border-color: var(--warn); }
+  .mp-ping.bad{ color: #fecaca; border-color: var(--danger); }
+  .mp-status{
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .mp-status.ready{ color: #bbf7d0; }
+  .mp-perms{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .mp-perm-toggle{
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .mp-perm-toggle.on{ color: #bbf7d0; border-color: var(--ok); background: rgba(34,197,94,0.1); }
+  .mp-perm-cap{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .mp-perm-cap input{
+    width: 56px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 12px;
+  }
+  .mp-perm-cap span{ font-size: 11px; color: var(--muted); }
+  .mp-kick-btn{
+    font-size: 11px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--danger);
+    background: transparent;
+    color: #fecaca;
+    cursor: pointer;
+  }
+  .mp-kick-btn:hover{ background: rgba(239,68,68,0.15); }
+
+  /* --- In-game multiplayer HUD (top-left, players + ping) --- */
+  .mp-hud{
+    position: absolute;
+    top: 14px;
+    left: 14px;
+    z-index: 5;
+    max-width: 280px;
+  }
+  .mp-hud-toggle{
+    background: rgba(23,23,26,0.9);
+    border: 1px solid var(--line);
+    color: var(--text);
+    font-size: 12px;
+    padding: 7px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .mp-hud-list{
+    margin-top: 8px;
+    background: rgba(15,15,17,0.97);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px;
+    max-height: 60vh;
+    overflow-y: auto;
+    display: none;
+  }
+  .mp-hud-list.open{ display: block; }
+
+  .mp-client-mode #tp-brake,
+  .mp-client-mode #tp-reverse,
+  .mp-client-mode #tp-manual-route,
+  .mp-client-mode #ctx-brake,
+  .mp-client-mode #ctx-reverse,
+  .mp-client-mode #ctx-manual{
+    display: none !important;
+  }
 </style>
 </head>
 <body>
@@ -527,9 +768,17 @@
     <button id="btn-pause" title="Pause / resume">&#10074;&#10074;</button>
     <div class="clock" id="clock-display">05:50:00</div>
     <div class="speed-row">
+      <button class="warp-btn" id="warp-minus" title="Slower">&minus;</button>
       <input type="range" id="speed-slider" min="1" max="60" step="1" value="1">
       <span class="speed-label" id="speed-label">1x</span>
+      <button class="warp-btn" id="warp-plus" title="Faster">&plus;</button>
     </div>
+  </div>
+
+  <!-- Multiplayer in-game HUD: player list + ping, collapsible -->
+  <div class="mp-hud hidden" id="mp-hud">
+    <button class="mp-hud-toggle" id="mp-hud-toggle">Players &#9662;</button>
+    <div class="mp-player-list mp-hud-list" id="mp-hud-list"></div>
   </div>
 
   <div class="hint" id="hint">Drag to pan &middot; Scroll to zoom &middot; Click a depot track, then Spawn train</div>
@@ -549,6 +798,78 @@
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- ============================================================ -->
+  <!-- Multiplayer: mode select / username / host setup / join / lobby -->
+  <!-- ============================================================ -->
+  <div class="mp-overlay" id="mp-overlay">
+
+    <div class="mp-card" id="mp-screen-main">
+      <h1>TrainSig</h1>
+      <p>Play solo, or host / join a live multiplayer session.</p>
+      <button class="btn btn-primary btn-full" id="mp-btn-singleplayer">Singleplayer</button>
+      <button class="btn btn-full" id="mp-btn-multiplayer">Multiplayer</button>
+    </div>
+
+    <div class="mp-card hidden" id="mp-screen-username">
+      <h1>Choose a username</h1>
+      <p>This is how other players will see you.</p>
+      <input class="panel-input" id="mp-username-input" placeholder="Username" maxlength="18">
+      <div class="btn-row">
+        <button class="btn" id="mp-username-back">Back</button>
+        <button class="btn btn-primary" id="mp-username-next">Continue</button>
+      </div>
+    </div>
+
+    <div class="mp-card hidden" id="mp-screen-mpmenu">
+      <h1>Multiplayer</h1>
+      <p>Host a new room, or join one with a code.</p>
+      <button class="btn btn-primary btn-full" id="mp-btn-host">Host Room</button>
+      <button class="btn btn-full" id="mp-btn-join">Join Room</button>
+      <button class="btn" id="mp-mpmenu-back">Back</button>
+    </div>
+
+    <div class="mp-card hidden" id="mp-screen-hostsetup">
+      <h1>Host a room</h1>
+      <p>The room shares whatever map is currently loaded.</p>
+      <div class="mp-mapstatus-row">
+        <span id="mp-hostsetup-mapstatus">No diagram loaded yet.</span>
+        <button class="btn btn-sm" id="mp-hostsetup-import">Import Diagram</button>
+      </div>
+      <label class="mp-field-label">Player limit</label>
+      <input class="panel-input" type="number" min="1" id="mp-host-limit" placeholder="No limit">
+      <label class="mp-check"><input type="checkbox" id="mp-host-midjoin" checked> Allow players to join mid-game</label>
+      <div class="btn-row">
+        <button class="btn" id="mp-hostsetup-back">Back</button>
+        <button class="btn btn-primary" id="mp-hostsetup-go">Create Room</button>
+      </div>
+    </div>
+
+    <div class="mp-card hidden" id="mp-screen-join">
+      <h1>Join a room</h1>
+      <input class="panel-input" id="mp-join-code" placeholder="Room code" maxlength="8" style="text-transform:uppercase;letter-spacing:0.1em;">
+      <div class="btn-row">
+        <button class="btn" id="mp-join-back">Back</button>
+        <button class="btn btn-primary" id="mp-join-go">Join</button>
+      </div>
+    </div>
+
+    <div class="mp-card mp-card-wide hidden" id="mp-screen-lobby">
+      <h1 id="mp-lobby-title">Lobby</h1>
+      <div class="mp-roomcode-row hidden" id="mp-lobby-roomcode-row">
+        <span>Room code:</span>
+        <span class="mp-roomcode" id="mp-lobby-roomcode"></span>
+        <button class="btn btn-sm" id="mp-lobby-copy">Copy invite link</button>
+      </div>
+      <div class="mp-player-list" id="mp-lobby-players"></div>
+      <div id="mp-lobby-hostcontrols" class="hidden">
+        <button class="btn btn-primary btn-full" id="mp-lobby-start" disabled>Start (waiting for players&hellip;)</button>
+      </div>
+      <p class="mp-hint hidden" id="mp-lobby-waiting">Waiting for the host to start&hellip;</p>
+      <button class="btn" id="mp-lobby-leave" style="margin-top:10px;">Leave</button>
+    </div>
+
+  </div>
 
   <!-- Train detail panel -->
   <div class="side-panel" id="train-panel">
@@ -639,6 +960,23 @@
     </div>
   </div>
 
+  <!--
+    Trystero: WebRTC peer-to-peer networking with no backend to run or pay
+    for. Peer discovery ("signaling") piggybacks on free public BitTorrent
+    trackers; once two browsers find each other this way, all game traffic
+    flows directly over a WebRTC data channel, not through this or any
+    other server. Pinned to a known-stable version/API (0.19.0's
+    deep-import 'torrent' strategy) since Trystero has made breaking API
+    changes across recent releases - bump this deliberately, not blindly.
+    Trystero itself only ships as an ES module, so it's loaded here and
+    handed off to net.js (a plain classic script) via window.trystero.
+  -->
+  <script type="module">
+    import { joinRoom, selfId } from 'https://esm.run/trystero@0.19.0/torrent';
+    window.trystero = { joinRoom, selfId };
+    window.dispatchEvent(new Event('trystero-ready'));
+  </script>
   <script src="game.js"></script>
+  <script src="net.js"></script>
 </body>
 </html>
