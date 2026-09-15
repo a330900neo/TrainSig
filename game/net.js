@@ -298,13 +298,27 @@ const MP = {
                 }
             });
 
+            // WAN's first handshake to a self-signed relay can be much slower
+            // than a normal WebSocket connect (slow TLS negotiation, distant/
+            // congested network paths, etc.), so give it a soft heads-up at
+            // 12s and only treat it as a real failure at 45s. LAN (PeerJS+STUN)
+            // is normally fast, so it keeps the original 15s cutoff.
+            let softMs = transport === 'wan' ? 12000 : 15000;
+            let hardMs = transport === 'wan' ? 45000 : 15000;
+
+            setTimeout(() => {
+                if (!connected && this.active === false && this.peer === peer) {
+                    UI.setLobbyWaitingText('Still connecting to host\u2026 this can take up to a minute the first time.');
+                }
+            }, softMs);
+
             setTimeout(() => {
                 if (!connected && this.active === false && this.peer === peer) {
                     showToast(transport === 'wan'
                         ? "Couldn't reach the host - check the relay address and room code, and that relay.py is still running."
                         : "Couldn't reach the host - check the room code, and that you're both online (signaling needs internet access even on a LAN).");
                 }
-            }, 15000);
+            }, hardMs);
         });
     },
 
