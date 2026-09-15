@@ -263,12 +263,18 @@ const MP = {
 
             let connected = false;
             peer.on('open', (id) => {
-                this.selfId = id;
+                // LAN (real PeerJS): the local peer already has its own id
+                // at this point, independent of who it connects to.
+                // WAN (WanPeer): there's no such thing - the relay only
+                // assigns the client an id once it joins a specific room,
+                // which arrives via the connection's 'open' event below.
+                if (transport !== 'wan') this.selfId = id;
                 let hostId = mpHostPeerId(roomCode);
                 let conn = peer.connect(hostId, { reliable: true });
                 this.hostConn = conn;
 
-                conn.on('open', () => {
+                conn.on('open', (connSelfId) => {
+                    if (transport === 'wan') this.selfId = connSelfId;
                     connected = true;
                     this.active = true;
                     document.body.classList.add('mp-active');
@@ -830,7 +836,10 @@ class WanConnection {
         this._peer._sendData(this.peer, data);
     }
     close() { this._markClosed(); }
-    _markOpen() { this.open = true; this._emit('open'); }
+    // `id`, when given, is this connection's own relay-assigned id (only
+    // meaningful for the client's connection to the host - see hello_ok
+    // handling below). Host-side connections don't pass one.
+    _markOpen(id) { this.open = true; this._emit('open', id); }
     _markClosed() {
         if (!this.open) return;
         this.open = false;
@@ -872,8 +881,18 @@ class WanPeer {
         }
         this._ws = ws;
         ws.onopen = () => {
-            if (this._isHost) ws.send(JSON.stringify({ t: 'hello', role: 'host', room: this._room }));
-            // Client sends its hello from connect(), once it knows the room id.
+            if (this._isHost) {
+                ws.send(JSON.stringify({ t: 'hello', role: 'host', room: this._room }));
+                // Host's own id (the room code) is only confirmed once the
+                // relay accepts it - see the 'hello_ok' case below.
+            } else {
+                // Client sends its hello from connect(), once it knows the
+                // room id. Unlike PeerJS, this protocol has no independent
+                // client id until it joins a room, so there's no id to pass
+                // here - callers (net.js's joinRoom) don't need one yet,
+                // they just need to know the socket is ready to connect().
+                this._emit('open', null);
+            }
         };
         ws.onmessage = (ev) => {
             let frame;
@@ -909,7 +928,10 @@ class WanPeer {
         switch (f.t) {
             case 'hello_ok':
                 if (this._isHost) this._emit('open', this._room);
-                else if (this._clientConn) this._clientConn._markOpen();
+                // Client's relay-assigned id arrives here, tied to this
+                // specific connection to the host - pass it through so
+                // callers can pick up their real self id.
+                else if (this._clientConn) this._clientConn._markOpen(f.id);
                 break;
             case 'error':
                 this._emit('error', { type: f.reason || 'unknown' });
