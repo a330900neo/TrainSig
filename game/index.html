@@ -869,7 +869,20 @@
         <span id="mp-hostsetup-mapstatus">No diagram loaded yet.</span>
         <button class="btn btn-sm" id="mp-hostsetup-import">Import Diagram</button>
       </div>
-      <p class="mp-hint">One other player can join directly over your local network.</p>
+      <span class="mp-field-label">Who can join</span>
+      <div class="btn-row">
+        <button class="btn btn-sm btn-primary" id="mp-host-transport-lan">Same Wi-Fi (LAN)</button>
+        <button class="btn btn-sm" id="mp-host-transport-wan">Over the internet (WAN)</button>
+      </div>
+
+      <p class="mp-hint" id="mp-host-lan-hint">Other players on the same Wi-Fi/network can join directly &mdash; no setup needed.</p>
+
+      <div id="mp-host-wan-fields" class="hidden">
+        <span class="mp-field-label">Relay address</span>
+        <input class="panel-input" id="mp-host-relay-input" placeholder="e.g. 203.0.113.10:8443">
+        <p class="mp-hint">Run <code style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:4px;">python relay.py</code> on this computer first &mdash; it prints an address to paste here (see HOSTING.md).</p>
+      </div>
+
       <label class="mp-check"><input type="checkbox" id="mp-host-midjoin" checked> Allow players to join mid-game</label>
       <div class="btn-row">
         <button class="btn" id="mp-hostsetup-back">Back</button>
@@ -879,6 +892,18 @@
 
     <div class="mp-card hidden" id="mp-screen-join">
       <h1>Join a room</h1>
+
+      <div class="btn-row">
+        <button class="btn btn-sm btn-primary" id="mp-join-transport-lan">Same Wi-Fi (LAN)</button>
+        <button class="btn btn-sm" id="mp-join-transport-wan">Over the internet (WAN)</button>
+      </div>
+
+      <div id="mp-join-wan-fields" class="hidden">
+        <span class="mp-field-label">Relay address</span>
+        <input class="panel-input" id="mp-join-relay-input" placeholder="e.g. 203.0.113.10:8443 (from the host)">
+      </div>
+
+      <span class="mp-field-label">Room code</span>
       <input class="panel-input" id="mp-join-code" placeholder="Room code" maxlength="8" style="text-transform:uppercase;letter-spacing:0.1em;">
       <div class="btn-row">
         <button class="btn" id="mp-join-back">Back</button>
@@ -998,7 +1023,7 @@
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="game.js?v=15"></script>
-  <script src="net.js?v=15"></script>
+  <script src="game.js?v=16"></script>
+  <script src="net.js?v=16"></script>
 </body>
 </html>

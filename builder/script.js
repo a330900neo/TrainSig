@@ -2442,6 +2442,7 @@ function draw() {
     }
 
     const drawTrackSegment = (x1, y1, x2, y2, color, isSel, isHov, isOverpass) => {
+        ctx.lineCap = 'round';
         if (isOverpass) {
             ctx.beginPath();
             ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);

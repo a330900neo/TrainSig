@@ -1,13 +1,27 @@
 /**
  * net.js - Multiplayer layer for TrainSig.
  *
- * SERVERLESS*, FREE, LOW-LATENCY:
- * All game traffic flows directly over a WebRTC data channel. The offer and
- * answer are copied between browsers once during setup, so this needs no
- * signaling server and works from a static GitHub Pages site.
+ * TWO TRANSPORTS, ONE PROTOCOL:
+ * All the room/game logic below (join requests, permissions, state
+ * snapshots, inputs, ping, etc.) is transport-agnostic. It only ever talks
+ * to a small PeerJS-shaped object: `peer.on('open'/'connection'/'error')`,
+ * `peer.connect(id)`, and a connection object with `.peer`, `.open`,
+ * `.send(data)`, `.on('open'/'data'/'close'/'error')`. Two implementations
+ * exist:
  *
- * The host-authoritative game protocol below is unchanged; only the transport
- * setup is deliberately small and limited to one LAN guest.
+ *   - window.Peer (real PeerJS, WebRTC + Google STUN + PeerJS's public
+ *     cloud signaling broker) - used for "LAN" mode. Works great on the
+ *     same network out of the box, no server to run.
+ *
+ *   - WanPeer (this file, plain WebSocket to a self-hosted relay script,
+ *     no STUN/TURN/cloud broker at all) - used for "WAN" mode, for playing
+ *     with someone over the internet. The host runs relay.py once; it's a
+ *     dumb message forwarder, blind to game content.
+ *
+ * Because both expose the same shape, none of the room/game logic below
+ * needs to know or care which one is active - only hostRoom()/joinRoom()
+ * pick the constructor. Updating game rules or the message protocol never
+ * requires touching the transport, and vice versa.
  *
  * AUTHORITY MODEL:
  * Host-authoritative. The host is the only machine that runs the real
@@ -19,12 +33,10 @@
  * desync to worry about between machines.
  *
  * TOPOLOGY:
- * A real star, not just a logical one. Unlike a mesh library, PeerJS
- * connects exactly the pairs we ask it to: the host runs a single Peer
- * whose ID is derived from the room code, and each client runs its own
- * Peer (random ID, assigned by the signaling server) and opens ONE
- * DataConnection directly to the host's Peer ID. Clients never connect
- * to each other - there is no other WebRTC link to accidentally rely on.
+ * A real star, not just a logical one. The host runs a single Peer/WanPeer
+ * whose ID is derived from the room code; each client runs its own
+ * Peer/WanPeer and opens ONE connection directly to the host. Clients
+ * never connect to each other.
  *
  * This file is a plain classic (non-module) script loaded after game.js,
  * so it shares game.js's top-level scope directly: `state`, `trains`,
@@ -41,8 +53,7 @@ const SNAPSHOT_HZ = 30;           // host -> clients state broadcast rate
 const PING_INTERVAL_MS = 2000;
 const CURSOR_INTERVAL_MS = 33;    // ~30Hz cursor position updates
 
-// No hosted signaling or relay is used: host candidates are enough for
-// browsers on the same local network.
+// Only used by LAN mode. WAN mode uses no STUN/TURN at all - see WanPeer.
 const MP_ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' }
 ];
@@ -66,9 +77,9 @@ function mpDefaultPermissions() {
     };
 }
 
-// Deterministic color per player, derived from their PeerJS peerId, so
-// every client independently draws the same player in the same color
-// without the host needing to assign and broadcast one.
+// Deterministic color per player, derived from their peer id, so every
+// client independently draws the same player in the same color without
+// the host needing to assign and broadcast one.
 function mpColorForPeer(peerId) {
     let hash = 0;
     for (let i = 0; i < peerId.length; i++) hash = (hash * 31 + peerId.charCodeAt(i)) | 0;
@@ -83,13 +94,16 @@ function mpColorForPeer(peerId) {
 const MP = {
     active: false,      // true once in ANY multiplayer room (host or client)
     isHost: false,
-    peer: null,          // this machine's PeerJS Peer instance
+    peer: null,          // this machine's Peer/WanPeer instance
     selfId: null,
     username: null,
     roomCode: null,
 
-    conns: {},            // host-only: peerId -> open PeerJS DataConnection
-    hostConn: null,       // client-only: the single DataConnection to the host
+    transport: 'lan',     // 'lan' (PeerJS/WebRTC) or 'wan' (relay.py over WebSocket)
+    wanRelayUrl: null,    // e.g. 'wss://203.0.113.10:8443' - only used in 'wan' mode
+
+    conns: {},            // host-only: peerId -> open connection object
+    hostConn: null,       // client-only: the single connection to the host
     players: {},         // host-only: peerId -> player record (source of truth)
     roomSettings: { limit: null, allowMidGameJoin: true },
     started: false,
@@ -134,30 +148,42 @@ const MP = {
 
     // ---------------- Room lifecycle ----------------
 
+    // opts: { allowMidGameJoin, transport: 'lan'|'wan', wanRelayUrl }
     hostRoom(username, opts) {
         if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
+        opts = opts || {};
 
         this.username = username;
         this.isHost = true;
         this.roomSettings.limit = null; // unlimited players
         this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
-        this._hostOpen();
+        this.transport = opts.transport === 'wan' ? 'wan' : 'lan';
+        this.wanRelayUrl = opts.wanRelayUrl || null;
+
+        if (this.transport === 'wan' && !this.wanRelayUrl) {
+            showToast('Enter the relay address printed by relay.py first.');
+            this.isHost = false;
+            return;
+        }
+        this._hostOpen(3);
     },
 
-    // Tries to claim a fresh room code as our PeerJS ID. Collisions are rare
-    // (5 chars from a 32-char alphabet = ~33M combinations) but PeerJS
-    // rejects the whole Peer with an 'unavailable-id' error if the ID is
-    // already claimed on the broker, rather than just failing that one
-    // connection - so on that specific error we just try again with a new
-    // code, up to `attemptsLeft` times.
+    // Tries to claim a fresh room code as our host id. Collisions are rare
+    // (5 chars from a 32-char alphabet = ~33M combinations) but both
+    // PeerJS ('unavailable-id') and the relay ('room_taken') reject the
+    // whole connection rather than just failing silently, so on that
+    // specific error we just try again with a new code, up to
+    // `attemptsLeft` times.
     _hostOpen(attemptsLeft) {
         this.roomCode = mpRandomRoomCode();
         let hostId = mpHostPeerId(this.roomCode);
         let peer;
         try {
-            peer = new window.Peer(hostId, { config: { iceServers: MP_ICE_SERVERS } });
+            peer = (this.transport === 'wan')
+                ? new WanPeer(hostId, { relayUrl: this.wanRelayUrl })
+                : new window.Peer(hostId, { config: { iceServers: MP_ICE_SERVERS } });
         } catch (err) {
-            console.error('PeerJS host init error:', err);
+            console.error('Multiplayer host init error:', err);
             showToast("Couldn't open a multiplayer room. Check your connection and try again.");
             return;
         }
@@ -187,34 +213,46 @@ const MP = {
         peer.on('connection', (conn) => this._hostOnConnection(conn));
 
         peer.on('error', (err) => {
-            if (!settled && err && err.type === 'unavailable-id' && attemptsLeft > 1) {
+            let retryable = err && (err.type === 'unavailable-id' || err.type === 'room_taken');
+            if (!settled && retryable && attemptsLeft > 1) {
                 peer.destroy();
                 this._hostOpen(attemptsLeft - 1);
                 return;
             }
-            console.error('PeerJS host error:', err);
+            console.error('Multiplayer host error:', err);
             if (!settled) {
-                showToast("Couldn't open a multiplayer room. Check your connection and try again.");
+                showToast(this.transport === 'wan'
+                    ? "Couldn't reach the relay. Check the address and that relay.py is still running."
+                    : "Couldn't open a multiplayer room. Check your connection and try again.");
             } else if (this.active) {
                 showToast('A networking error occurred: ' + (err && err.type ? err.type : 'unknown'));
             }
         });
     },
 
-    joinRoom(code, username) {
+    // opts: { transport: 'lan'|'wan', wanRelayUrl }
+    joinRoom(code, username, opts) {
+        opts = opts || {};
         let roomCode = (code || '').trim().toUpperCase();
         if (!roomCode) { showToast('Enter a room code.'); return; }
+        let transport = opts.transport === 'wan' ? 'wan' : 'lan';
+        let wanRelayUrl = opts.wanRelayUrl || null;
+        if (transport === 'wan' && !wanRelayUrl) { showToast('Enter the relay address given by the host.'); return; }
 
-        this._whenReady(() => {
+        this._whenReady(transport, () => {
             this.username = username;
             this.isHost = false;
             this.roomCode = roomCode;
+            this.transport = transport;
+            this.wanRelayUrl = wanRelayUrl;
 
             let peer;
             try {
-                peer = new window.Peer({ config: { iceServers: MP_ICE_SERVERS } });
+                peer = (transport === 'wan')
+                    ? new WanPeer(null, { relayUrl: wanRelayUrl })
+                    : new window.Peer({ config: { iceServers: MP_ICE_SERVERS } });
             } catch (err) {
-                console.error('PeerJS client init error:', err);
+                console.error('Multiplayer client init error:', err);
                 showToast("Couldn't open a multiplayer connection. Check your connection and try again.");
                 return;
             }
@@ -239,17 +277,22 @@ const MP = {
                 conn.on('data', (data) => this._onMessage(data, hostId));
                 conn.on('close', () => this._clientHandleDisconnect());
                 conn.on('error', (err) => {
-                    console.error('PeerJS client connection error:', err);
+                    console.error('Multiplayer client connection error:', err);
                 });
             });
 
             peer.on('error', (err) => {
-                console.error('PeerJS client error:', err);
+                console.error('Multiplayer client error:', err);
                 if (err && err.type === 'peer-unavailable') {
                     showToast("Couldn't find that room - check the room code.");
                     this.leaveRoom();
+                } else if (err && err.type === 'no_such_room') {
+                    showToast("Couldn't find that room on the relay - check the room code and relay address.");
+                    this.leaveRoom();
                 } else if (!connected) {
-                    showToast("Couldn't reach the host - check your connection and try again.");
+                    showToast(transport === 'wan'
+                        ? "Couldn't reach the host - check the relay address and try again."
+                        : "Couldn't reach the host - check your connection and try again.");
                 } else if (this.active) {
                     showToast('A networking error occurred: ' + (err && err.type ? err.type : 'unknown'));
                 }
@@ -257,18 +300,21 @@ const MP = {
 
             setTimeout(() => {
                 if (!connected && this.active === false && this.peer === peer) {
-                    showToast("Couldn't reach the host - check the room code, and that you're both online (signaling needs internet access even on a LAN).");
+                    showToast(transport === 'wan'
+                        ? "Couldn't reach the host - check the relay address and room code, and that relay.py is still running."
+                        : "Couldn't reach the host - check the room code, and that you're both online (signaling needs internet access even on a LAN).");
                 }
             }, 15000);
         });
     },
 
-    // PeerJS loads from a CDN script tag (see index.html) which in the
-    // overwhelming majority of cases is ready long before a user clicks
-    // Host/Join, but this covers the edge case (very slow network)
-    // gracefully instead of throwing.
-    _whenReady(fn) {
-        if (window.Peer) { fn(); return; }
+    // LAN mode loads PeerJS from a CDN script tag (see index.html), which
+    // in the overwhelming majority of cases is ready long before a user
+    // clicks Host/Join, but this covers the edge case (very slow network)
+    // gracefully instead of throwing. WAN mode's WanPeer is defined in
+    // this same file, so it's always immediately ready.
+    _whenReady(transport, fn) {
+        if (transport === 'wan' || window.Peer) { fn(); return; }
         showToast('Still connecting to the networking library\u2026');
         let tries = 0;
         let timer = setInterval(() => {
@@ -331,7 +377,7 @@ const MP = {
         this._broadcastPlayerList();
     },
 
-    // Host-side: a client's DataConnection has come in. We don't know which
+    // Host-side: a client's connection has come in. We don't know which
     // player this becomes until their JOIN_REQUEST arrives (that's where
     // this.players[peerId] gets created) - this just wires up plumbing.
     _hostOnConnection(conn) {
@@ -339,7 +385,7 @@ const MP = {
         this.conns[peerId] = conn;
         conn.on('data', (data) => this._onMessage(data, peerId));
         conn.on('close', () => this._onPeerLeave(peerId));
-        conn.on('error', (err) => console.error('PeerJS host connection error:', err));
+        conn.on('error', (err) => console.error('Multiplayer host connection error:', err));
     },
 
     // Sends `data` to `target` (a peerId) if given, otherwise broadcasts to
@@ -730,216 +776,172 @@ const MP = {
 };
 window.MP = MP;
 
-// Static-site multiplayer transport. Signaling is intentionally manual:
-// players exchange one offer and one answer, then all game data is direct.
-function mpWaitForIce(peer) {
-    if (peer.iceGatheringState === 'complete') return Promise.resolve();
-    return new Promise(resolve => {
-        let done = () => {
-            if (peer.iceGatheringState === 'complete') {
-                peer.removeEventListener('icegatheringstatechange', done);
-                resolve();
-            }
-        };
-        peer.addEventListener('icegatheringstatechange', done);
-        setTimeout(() => {
-            peer.removeEventListener('icegatheringstatechange', done);
-            resolve();
-        }, 5000);
-    });
+// ============================================================
+// --- WAN transport: a minimal PeerJS-shaped shim over a plain
+//     WebSocket, backed by the self-hosted relay.py dumb relay.
+//     No STUN, no TURN, no cloud broker - relay.py just forwards
+//     bytes between whichever sockets it's told to, blind to what's
+//     inside. Everything above this point (room logic, permissions,
+//     snapshots, game protocol) is unaware this exists; it only sees
+//     the same on/connect/send/open/data/close/error shape PeerJS
+//     already provides.
+//
+// Wire protocol with relay.py (JSON text frames):
+//   -> {t:'hello', role:'host'|'client', room:'<id>'}      (first frame)
+//   <- {t:'hello_ok', id:'<selfId>'}                       (accepted)
+//   <- {t:'error', reason:'room_taken'|'no_such_room'}     (rejected)
+//   <- {t:'join', id:'<clientId>'}                         (host only)
+//   <- {t:'leave', id:'<clientId>'}                        (host only)
+//   <- {t:'host_left'}                                     (client only)
+//   -> {t:'data', to:'<clientId>'?, payload:<any>}         (host: to= targets one client, omit to broadcast)
+//   -> {t:'data', payload:<any>}                           (client: always goes to the host)
+//   <- {t:'data', from:'<clientId>'?, payload:<any>}       (host receives `from`; client doesn't need it - only one peer)
+// ============================================================
+
+class WanConnection {
+    constructor(parentPeer, peerId) {
+        this._peer = parentPeer;
+        this.peer = peerId;   // remote id, mirrors PeerJS DataConnection.peer
+        this.open = false;
+        this._handlers = {};
+    }
+    on(evt, cb) { (this._handlers[evt] = this._handlers[evt] || []).push(cb); }
+    _emit(evt, arg) {
+        for (let cb of (this._handlers[evt] || [])) {
+            try { cb(arg); } catch (e) { console.error(e); }
+        }
+    }
+    send(data) {
+        if (!this.open) return;
+        this._peer._sendData(this.peer, data);
+    }
+    close() { this._markClosed(); }
+    _markOpen() { this.open = true; this._emit('open'); }
+    _markClosed() {
+        if (!this.open) return;
+        this.open = false;
+        this._emit('close');
+    }
 }
 
-MP._wireChannel = function (channel, peerId) {
-    channel.onmessage = event => {
-        let data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-        this._onMessage(data, peerId);
-    };
-    channel.onclose = () => this._onPeerLeave(peerId);
-    channel.onerror = event => console.error('WebRTC data channel error:', event);
-};
+class WanPeer {
+    // hostId provided -> host role, registering exactly that room id
+    //   (mirrors `new Peer(hostId)`).
+    // no hostId -> client role; caller must call connect(hostId) next
+    //   (mirrors `new Peer()`).
+    constructor(hostId, opts) {
+        opts = opts || {};
+        this.relayUrl = opts.relayUrl;
+        this._isHost = typeof hostId === 'string' && hostId.length > 0;
+        this._room = this._isHost ? hostId : null;
+        this._handlers = {};
+        this._conns = {};        // host-only: clientId -> WanConnection
+        this._clientConn = null; // client-only: the single connection to the host
+        this._destroyed = false;
+        this._connectSocket();
+    }
 
-MP._hostOnConnection = function (channel, peerId) {
-    let id = peerId || 'guest';
-    this.conns[id] = channel;
-    this._wireChannel(channel, id);
-    channel.onopen = () => {
-        if (this.active) showToast('Player connected. You can start the game.');
-    };
-};
-
-MP._clientOnConnection = function (channel) {
-    this.hostConn = channel;
-    this._wireChannel(channel, 'host');
-    channel.onopen = () => {
-        this.active = true;
-        this._send({ type: 'JOIN_REQUEST', username: this.username });
-    };
-};
-
-MP._send = function (data, target) {
-    if (this.isHost) {
-        if (target) {
-            let channel = this.conns[target];
-            if (channel && channel.readyState === 'open') channel.send(JSON.stringify(data));
-        } else {
-            Object.values(this.conns).forEach(channel => {
-                if (channel.readyState === 'open') channel.send(JSON.stringify(data));
-            });
+    on(evt, cb) { (this._handlers[evt] = this._handlers[evt] || []).push(cb); }
+    _emit(evt, arg) {
+        for (let cb of (this._handlers[evt] || [])) {
+            try { cb(arg); } catch (e) { console.error(e); }
         }
-    } else if (this.hostConn && this.hostConn.readyState === 'open') {
-        this.hostConn.send(JSON.stringify(data));
     }
-};
 
-MP._hostOnConnection = function (conn) {
-    let peerId = conn.peer;
-    this.conns[peerId] = conn;
-    conn.on('data', data => this._onMessage(data, peerId));
-    conn.on('close', () => this._onPeerLeave(peerId));
-    conn.on('error', err => console.error('PeerJS host connection error:', err));
-};
-
-MP.leaveRoom = function () {
-    this.active = false;
-    if (this.peer) this.peer.destroy();
-    window.location.href = window.location.pathname;
-};
-
-MP.hostRoom = async function (username, opts) {
-    if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
-    try {
-        this.username = username;
-        this.isHost = true;
-        this.roomSettings.limit = null; // unlimited players
-        this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
-        this.peer = new RTCPeerConnection({ iceServers: MP_ICE_SERVERS });
-        this.selfId = 'host';
-        this._hostOnConnection(this.peer.createDataChannel('trainsig', { ordered: true }), 'guest');
-        await this.peer.setLocalDescription(await this.peer.createOffer());
-        await mpWaitForIce(this.peer);
-        document.getElementById('mp-host-offer').value = JSON.stringify(this.peer.localDescription);
-        document.getElementById('mp-host-signaling').classList.remove('hidden');
-        this.active = true;
-        this.players[this.selfId] = {
-            peerId: this.selfId, username: this.username, permissions: mpDefaultPermissions(),
-            pingMs: 0, status: 'ready', isHost: true
-        };
-        UI.showLobby(true);
-        this._broadcastPlayerList();
-    } catch (err) {
-        console.error('WebRTC host setup error:', err);
-        showToast("Couldn't create a LAN room. Use a modern browser and try again.");
-    }
-};
-
-MP.joinRoom = async function (offerText, username) {
-    try {
-        this.username = username;
-        this.isHost = false;
-        this.selfId = 'guest-' + Math.random().toString(36).slice(2, 8);
-        this.peer = new RTCPeerConnection({ iceServers: MP_ICE_SERVERS });
-        this.peer.ondatachannel = event => this._clientOnConnection(event.channel);
-        await this.peer.setRemoteDescription(JSON.parse((offerText || '').trim()));
-        await this.peer.setLocalDescription(await this.peer.createAnswer());
-        await mpWaitForIce(this.peer);
-        document.getElementById('mp-join-answer').value = JSON.stringify(this.peer.localDescription);
-        document.getElementById('mp-join-signaling').classList.remove('hidden');
-        document.body.classList.add('mp-client-mode');
-        UI.showLobby(false);
-        UI.setLobbyWaitingText('Send the answer to the host. Waiting for connection\u2026');
-    } catch (err) {
-        console.error('WebRTC join setup error:', err);
-        showToast('That offer is invalid or could not be opened.');
-    }
-};
-
-MP.connectHost = async function (answerText) {
-    if (!this.isHost || !this.peer) return;
-    try {
-        await this.peer.setRemoteDescription(JSON.parse((answerText || '').trim()));
-        showToast('Answer accepted. Waiting for the player to connect\u2026');
-    } catch (err) {
-        console.error('WebRTC answer error:', err);
-        showToast('That answer is invalid. Paste the complete answer and try again.');
-    }
-};
-
-MP.leaveRoom = function () {
-    this.active = false;
-    if (this.peer) this.peer.destroy();
-    window.location.href = window.location.pathname;
-};
-
-// Simple room-code transport for static hosting. PeerJS is only used for
-// discovery/signaling; game traffic remains on the direct WebRTC channel.
-MP.hostRoom = function (username, opts) {
-    if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
-    this.username = username;
-    this.isHost = true;
-    this.roomSettings.limit = null; // unlimited players
-    this.roomSettings.allowMidGameJoin = !!opts.allowMidGameJoin;
-    this._hostOpen(3);
-};
-
-MP.joinRoom = function (code, username) {
-    let roomCode = (code || '').trim().toUpperCase();
-    if (!roomCode) { showToast('Enter a room code.'); return; }
-    this._whenReady(() => {
-        this.username = username;
-        this.isHost = false;
-        this.roomCode = roomCode;
-        let peer;
+    _connectSocket() {
+        let ws;
         try {
-            peer = new window.Peer({ config: { iceServers: MP_ICE_SERVERS } });
+            ws = new WebSocket(this.relayUrl);
         } catch (err) {
-            console.error('PeerJS client init error:', err);
-            showToast("Couldn't open a multiplayer connection. Check your connection and try again.");
+            this._emit('error', { type: 'network', message: String(err) });
             return;
         }
-        this.peer = peer;
-        document.body.classList.add('mp-client-mode');
-        UI.showLobby(false);
-        UI.setLobbyWaitingText('Connecting to host...');
-        let connected = false;
-        peer.on('open', id => {
-            this.selfId = id;
-            let conn = peer.connect(mpHostPeerId(roomCode), { reliable: true });
-            this.hostConn = conn;
-            conn.on('open', () => {
-                connected = true;
-                this.active = true;
-                this._send({ type: 'JOIN_REQUEST', username: this.username });
-            });
-            conn.on('data', data => this._onMessage(data, mpHostPeerId(roomCode)));
-            conn.on('close', () => this._clientHandleDisconnect());
-            conn.on('error', err => console.error('PeerJS client connection error:', err));
-        });
-        peer.on('error', err => {
-            console.error('PeerJS client error:', err);
-            if (!connected) {
-                showToast(err && err.type === 'peer-unavailable'
-                    ? "Couldn't find that room. Check the code."
-                    : "Couldn't reach the host. Check both players are online.");
-                this.leaveRoom();
+        this._ws = ws;
+        ws.onopen = () => {
+            if (this._isHost) ws.send(JSON.stringify({ t: 'hello', role: 'host', room: this._room }));
+            // Client sends its hello from connect(), once it knows the room id.
+        };
+        ws.onmessage = (ev) => {
+            let frame;
+            try { frame = JSON.parse(ev.data); } catch (e) { return; }
+            this._onFrame(frame);
+        };
+        ws.onerror = () => {
+            this._emit('error', { type: 'network', message: 'Could not reach the relay server.' });
+        };
+        ws.onclose = () => {
+            if (this._destroyed) return;
+            if (this._isHost) {
+                for (let id in this._conns) this._conns[id]._markClosed();
+            } else if (this._clientConn) {
+                this._clientConn._markClosed();
             }
-        });
-    });
-};
-
-MP._send = function (data, target) {
-    if (this.isHost) {
-        if (target) {
-            let conn = this.conns[target];
-            if (conn && conn.open) conn.send(data);
-        } else {
-            Object.values(this.conns).forEach(conn => {
-                if (conn.open) conn.send(data);
-            });
-        }
-    } else if (this.hostConn && this.hostConn.open) {
-        this.hostConn.send(data);
+        };
     }
-};
+
+    // Client role only, mirrors PeerJS `peer.connect(hostId)`.
+    connect(hostId) {
+        this._room = hostId;
+        let conn = new WanConnection(this, 'host');
+        this._clientConn = conn;
+        let sendHello = () => this._ws.send(JSON.stringify({ t: 'hello', role: 'client', room: this._room }));
+        if (this._ws.readyState === WebSocket.OPEN) sendHello();
+        else this._ws.addEventListener('open', sendHello, { once: true });
+        return conn;
+    }
+
+    _onFrame(f) {
+        if (!f || !f.t) return;
+        switch (f.t) {
+            case 'hello_ok':
+                if (this._isHost) this._emit('open', this._room);
+                else if (this._clientConn) this._clientConn._markOpen();
+                break;
+            case 'error':
+                this._emit('error', { type: f.reason || 'unknown' });
+                break;
+            case 'join': {
+                if (!this._isHost) break;
+                let conn = new WanConnection(this, f.id);
+                this._conns[f.id] = conn;
+                conn._markOpen();
+                this._emit('connection', conn);
+                break;
+            }
+            case 'leave': {
+                if (!this._isHost) break;
+                let conn = this._conns[f.id];
+                if (conn) { conn._markClosed(); delete this._conns[f.id]; }
+                break;
+            }
+            case 'host_left':
+                if (this._clientConn) this._clientConn._markClosed();
+                break;
+            case 'data':
+                if (this._isHost) {
+                    let conn = this._conns[f.from];
+                    if (conn) conn._emit('data', f.payload);
+                } else if (this._clientConn) {
+                    this._clientConn._emit('data', f.payload);
+                }
+                break;
+        }
+    }
+
+    _sendData(targetId, payload) {
+        if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
+        if (this._isHost) {
+            this._ws.send(JSON.stringify({ t: 'data', to: targetId, payload }));
+        } else {
+            this._ws.send(JSON.stringify({ t: 'data', payload }));
+        }
+    }
+
+    destroy() {
+        this._destroyed = true;
+        try { this._ws && this._ws.close(); } catch (e) { /* ignore */ }
+    }
+}
 
 // ============================================================
 // --- UI: menu / lobby / in-game HUD ---
@@ -949,6 +951,8 @@ const UI = {
     _screens: ['mp-screen-main', 'mp-screen-username', 'mp-screen-mpmenu',
         'mp-screen-hostsetup', 'mp-screen-join', 'mp-screen-lobby'],
     _usernameNext: null, // function to call once a username has been entered
+    _hostTransport: 'lan',
+    _joinTransport: 'lan',
 
     show(id) {
         for (let s of this._screens) document.getElementById(s).classList.toggle('hidden', s !== id);
@@ -979,6 +983,23 @@ const UI = {
             el.classList.remove('ok');
         }
         goBtn.disabled = !hasLoadedDiagram;
+    },
+
+    // Toggles the LAN/WAN choice on the "Host a room" screen.
+    setHostTransport(mode) {
+        this._hostTransport = mode;
+        document.getElementById('mp-host-transport-lan').classList.toggle('btn-primary', mode === 'lan');
+        document.getElementById('mp-host-transport-wan').classList.toggle('btn-primary', mode === 'wan');
+        document.getElementById('mp-host-wan-fields').classList.toggle('hidden', mode !== 'wan');
+        document.getElementById('mp-host-lan-hint').classList.toggle('hidden', mode !== 'lan');
+    },
+
+    // Toggles the LAN/WAN choice on the "Join a room" screen.
+    setJoinTransport(mode) {
+        this._joinTransport = mode;
+        document.getElementById('mp-join-transport-lan').classList.toggle('btn-primary', mode === 'lan');
+        document.getElementById('mp-join-transport-wan').classList.toggle('btn-primary', mode === 'wan');
+        document.getElementById('mp-join-wan-fields').classList.toggle('hidden', mode !== 'wan');
     },
 
     showLobby(isHost) {
@@ -1139,6 +1160,7 @@ document.getElementById('mp-mpmenu-back').addEventListener('click', () => UI.sho
 document.getElementById('mp-btn-host').addEventListener('click', () => {
     UI.show('mp-screen-hostsetup');
     UI.updateHostSetupMapStatus();
+    UI.setHostTransport('lan');
 });
 document.getElementById('mp-hostsetup-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
 document.getElementById('mp-hostsetup-import').addEventListener('click', () => {
@@ -1146,18 +1168,42 @@ document.getElementById('mp-hostsetup-import').addEventListener('click', () => {
     importInput.click();
 });
 window.addEventListener('diagram-loaded', () => UI.updateHostSetupMapStatus());
+
+document.getElementById('mp-host-transport-lan').addEventListener('click', () => UI.setHostTransport('lan'));
+document.getElementById('mp-host-transport-wan').addEventListener('click', () => UI.setHostTransport('wan'));
+
 document.getElementById('mp-hostsetup-go').addEventListener('click', () => {
     if (!hasLoadedDiagram) { showToast('Import or build a diagram before hosting.'); return; }
+    let transport = UI._hostTransport;
+    let relayInput = document.getElementById('mp-host-relay-input').value.trim();
+    if (transport === 'wan' && !relayInput) { showToast('Enter the relay address printed by relay.py.'); return; }
     UI.goUsername(() => {
-        MP.hostRoom(UI._pendingUsername, { allowMidGameJoin: true });
+        MP.hostRoom(UI._pendingUsername, {
+            allowMidGameJoin: document.getElementById('mp-host-midjoin').checked,
+            transport,
+            wanRelayUrl: transport === 'wan' ? ('wss://' + relayInput.replace(/^wss?:\/\//i, '')) : null
+        });
     });
 });
 
-document.getElementById('mp-btn-join').addEventListener('click', () => UI.show('mp-screen-join'));
+document.getElementById('mp-btn-join').addEventListener('click', () => {
+    UI.show('mp-screen-join');
+    UI.setJoinTransport('lan');
+});
 document.getElementById('mp-join-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
+
+document.getElementById('mp-join-transport-lan').addEventListener('click', () => UI.setJoinTransport('lan'));
+document.getElementById('mp-join-transport-wan').addEventListener('click', () => UI.setJoinTransport('wan'));
+
 document.getElementById('mp-join-go').addEventListener('click', () => {
     let code = document.getElementById('mp-join-code').value;
-    UI.goUsername(() => MP.joinRoom(code, UI._pendingUsername));
+    let transport = UI._joinTransport;
+    let relayInput = document.getElementById('mp-join-relay-input').value.trim();
+    if (transport === 'wan' && !relayInput) { showToast('Enter the relay address given by the host.'); return; }
+    UI.goUsername(() => MP.joinRoom(code, UI._pendingUsername, {
+        transport,
+        wanRelayUrl: transport === 'wan' ? ('wss://' + relayInput.replace(/^wss?:\/\//i, '')) : null
+    }));
 });
 
 document.getElementById('mp-username-back').addEventListener('click', () => UI.show('mp-screen-mpmenu'));
@@ -1172,6 +1218,9 @@ document.getElementById('mp-lobby-start').addEventListener('click', () => MP.sta
 document.getElementById('mp-lobby-leave').addEventListener('click', () => MP.leaveRoom());
 document.getElementById('mp-lobby-copy').addEventListener('click', () => {
     let url = window.location.origin + window.location.pathname + '?room=' + MP.roomCode;
+    if (MP.transport === 'wan' && MP.wanRelayUrl) {
+        url += '&relay=' + encodeURIComponent(MP.wanRelayUrl.replace(/^wss?:\/\//i, ''));
+    }
     navigator.clipboard.writeText(url).then(
         () => showToast('Invite link copied.'),
         () => showToast('Room code: ' + MP.roomCode)
@@ -1182,12 +1231,22 @@ document.getElementById('mp-hud-toggle').addEventListener('click', () => {
     document.getElementById('mp-hud-list').classList.toggle('open');
 });
 
-// ---- Boot: invite links can pre-fill the room code.
+// ---- Boot: invite links can pre-fill the room code (and, for WAN, the
+// relay address) so joining is a single click.
 (function mpBoot() {
-    let roomFromLink = new URLSearchParams(window.location.search).get('room');
+    let params = new URLSearchParams(window.location.search);
+    let roomFromLink = params.get('room');
+    let relayFromLink = params.get('relay');
     if (roomFromLink) {
         document.getElementById('mp-join-code').value = roomFromLink;
-        UI.goUsername(() => MP.joinRoom(roomFromLink, UI._pendingUsername));
+        if (relayFromLink) {
+            document.getElementById('mp-join-relay-input').value = relayFromLink;
+            UI.setJoinTransport('wan');
+        }
+        UI.goUsername(() => MP.joinRoom(roomFromLink, UI._pendingUsername, {
+            transport: relayFromLink ? 'wan' : 'lan',
+            wanRelayUrl: relayFromLink ? ('wss://' + relayFromLink) : null
+        }));
     } else {
         UI.show('mp-screen-main');
     }
