@@ -42,7 +42,8 @@ pip install websockets cryptography
    connect — that's expected, they click through it too.
 
 ## If a friend can't connect
-
+- Make sure friend open the IP with https:// at front, and click through the browser's
+   certificate warning ("Advanced" -> "Proceed"):
 - Make sure `relay.py` is still running in your terminal.
 - The script tries to forward its port on your router automatically
   (UPnP). If that failed, it prints the port to forward manually —
