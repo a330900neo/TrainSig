@@ -306,15 +306,44 @@ def try_upnp_map(port: int) -> bool:
 # --- Entry point ---
 # ============================================================
 
-async def serve(ssl_ctx, port):
-    async with websockets.serve(handler, "0.0.0.0", port, ssl=ssl_ctx, max_size=2 ** 20):
+async def serve(ssl_ctx, port, bind_host):
+    async with websockets.serve(handler, bind_host, port, ssl=ssl_ctx, max_size=2 ** 20):
         await asyncio.Future()  # run forever
 
 
 def main():
     parser = argparse.ArgumentParser(description="TrainSig WAN relay - a dumb message router, no STUN/TURN/cloud service.")
     parser.add_argument("--port", type=int, default=8443, help="TCP port to listen on (default: 8443)")
+    parser.add_argument("--no-tls", action="store_true",
+                         help="Serve plain ws:// on 127.0.0.1 instead of wss://. "
+                              "Use this when putting the relay behind a tunnel "
+                              "(e.g. cloudflared) that terminates TLS for you - "
+                              "skips the self-signed cert and the router/UPnP dance "
+                              "entirely, since nothing needs to be reachable from "
+                              "the open internet directly.")
     args = parser.parse_args()
+
+    if args.no_tls:
+        print("Setting up (--no-tls mode: plain ws:// on 127.0.0.1, no cert, no UPnP)...")
+        print()
+        print("=" * 64)
+        print(" TrainSig relay is running (plain ws://, local-only)")
+        print("=" * 64)
+        print(f"Listening on ws://127.0.0.1:{args.port}")
+        print()
+        print("This machine isn't reachable from the internet by itself in this")
+        print("mode. Point a TLS-terminating tunnel (e.g. cloudflared) at this")
+        print(f"port, then give the game the tunnel's hostname, not this port:")
+        print(f"   cloudflared tunnel --url http://localhost:{args.port}")
+        print()
+        print("Press Ctrl+C to stop hosting.")
+        print("=" * 64)
+        print()
+        try:
+            asyncio.run(serve(None, args.port, "127.0.0.1"))
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        return
 
     cert_dir = Path.home() / ".trainsig-relay"
     cert_path, key_path = ensure_cert(cert_dir)
@@ -334,9 +363,12 @@ def main():
         print(f"Port {args.port} was forwarded automatically on your router.")
     else:
         print(f"Couldn't forward port {args.port} automatically (some routers")
-        print(f"don't support this). Forward TCP port {args.port} to this")
-        print(f"computer ({local_ip}) in your router's settings, then restart")
-        print("this script. The relay is running either way.")
+        print(f"don't support this, or you may not have access to its admin")
+        print(f"settings). Forward TCP port {args.port} to this computer")
+        print(f"({local_ip}) in your router's settings and restart this script,")
+        print(f"OR - if you can't get into the router at all - re-run with")
+        print(f"--no-tls and put a tunnel like cloudflared in front instead")
+        print(f"(no router access needed). The relay is running either way.")
     print()
     if public_ip:
         print("STEP 1 - open this yourself once, and click through the browser's")
@@ -359,7 +391,7 @@ def main():
     print()
 
     try:
-        asyncio.run(serve(ssl_ctx, args.port))
+        asyncio.run(serve(ssl_ctx, args.port, "0.0.0.0"))
     except KeyboardInterrupt:
         print("\nStopped.")
 
