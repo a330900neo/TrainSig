@@ -36,6 +36,7 @@
 
 // --- Persisted diagram state (as imported/exported by the Builder) ---
 let state = {
+    meta: { name: '', description: '', startTime: '05:50' },
     points: [],
     tracks: [],
     platforms: [],
@@ -48,8 +49,24 @@ let state = {
 let hasLoadedDiagram = false;
 
 // --- Simulation clock ---
-// In-game time of day, in seconds since midnight. Service starts at 05:50.
+// In-game time of day, in seconds since midnight. Defaults to 05:50 until a
+// diagram is loaded; loadDiagram() then re-derives this from the diagram's
+// own meta.startTime (set in the Builder's Map Settings), falling back to
+// this same 05:50 default for diagrams exported before that field existed.
 let simTimeSeconds = 5 * 3600 + 50 * 60;
+const DEFAULT_START_TIME = '05:50';
+
+// Parses a "HH:MM" 24h string into seconds-since-midnight, falling back to
+// the default start time for anything missing/malformed.
+function parseStartTimeToSeconds(hhmm) {
+    let m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || '').trim());
+    if (!m) return 5 * 3600 + 50 * 60;
+    let h = parseInt(m[1], 10), min = parseInt(m[2], 10);
+    if (!isFinite(h) || !isFinite(min)) return 5 * 3600 + 50 * 60;
+    h = ((h % 24) + 24) % 24;
+    min = ((min % 60) + 60) % 60;
+    return h * 3600 + min * 60;
+}
 let simSpeed = 1; // 1x - 60x, how many game-seconds pass per real second
 let simPaused = true; // starts paused - the player must press play to begin service
 let lastFrameTime = null;
@@ -3633,6 +3650,16 @@ function loadDiagram(parsed) {
     state.lines = Array.isArray(parsed.lines) ? parsed.lines : [];
     state.demand = (parsed.demand && typeof parsed.demand === 'object') ? parsed.demand : null;
 
+    // Diagrams exported before the Builder's Map Settings feature existed
+    // won't have a `meta` object at all - default it in rather than leaving
+    // state.meta stale from whatever was loaded previously.
+    let m = (parsed.meta && typeof parsed.meta === 'object') ? parsed.meta : {};
+    state.meta = {
+        name: typeof m.name === 'string' ? m.name : '',
+        description: typeof m.description === 'string' ? m.description : '',
+        startTime: /^\d{1,2}:\d{2}$/.test(m.startTime) ? m.startTime : DEFAULT_START_TIME
+    };
+
     state.signals.forEach(s => {
         if (s.state !== 'blue' && s.state !== 'red') s.state = 'red';
         // A signal's direction (1 or -1) is what makes it apply to a train
@@ -3662,15 +3689,15 @@ function loadDiagram(parsed) {
     setEmptyStateVisible(false);
     fitCameraToDiagram();
 
-    simTimeSeconds = 5 * 3600 + 50 * 60;
+    simTimeSeconds = parseStartTimeToSeconds(state.meta.startTime);
     setPaused(true);
     updateClockDisplay();
 
     draw();
 
-    // Let other listeners (e.g. the multiplayer host-setup screen in
-    // net.js) know a diagram is now available, without net.js needing to
-    // know anything about how loadDiagram works internally.
+    // Let other listeners (e.g. the multiplayer host-setup screen and main
+    // menu map status in net.js) know a diagram is now available, without
+    // them needing to know anything about how loadDiagram works internally.
     window.dispatchEvent(new Event('diagram-loaded'));
 }
 
@@ -3681,6 +3708,15 @@ function handleImportFile(file) {
         try {
             const parsed = JSON.parse(e.target.result);
             loadDiagram(parsed);
+            // Remember this map in the browser so it shows up as a pickable
+            // saved map next time, instead of requiring re-import every visit.
+            let fallbackName = file.name ? file.name.replace(/\.json$/i, '') : 'Untitled map';
+            saveMapToLibrary({
+                points: state.points, tracks: state.tracks, platforms: state.platforms,
+                signals: state.signals, labels: state.labels, lines: state.lines,
+                demand: state.demand, meta: state.meta
+            }, fallbackName);
+            showToast('Imported' + (state.meta.name ? ' "' + state.meta.name + '"' : '') + ' \u2014 saved to this browser for next time.');
         } catch (err) {
             showToast('Could not read that file - is it a diagram export?');
         }
@@ -3688,6 +3724,150 @@ function handleImportFile(file) {
     reader.onerror = () => showToast('Could not read that file.');
     reader.readAsText(file);
 }
+
+// ============================================================
+// --- Saved map library (localStorage, per-browser) ---
+// ============================================================
+// Lets the main menu offer previously-imported maps without the player
+// having to keep the original .json file around and re-import it each
+// visit. Purely a convenience layer on top of the same loadDiagram() path
+// used by a fresh import - nothing here is authoritative game state.
+
+const SAVED_MAPS_KEY = 'trainsig_saved_maps';
+const SAVED_MAPS_MAX = 30; // evict oldest beyond this so storage can't grow unbounded
+
+function loadSavedMapsRaw() {
+    try {
+        let raw = localStorage.getItem(SAVED_MAPS_KEY);
+        let list = raw ? JSON.parse(raw) : [];
+        return Array.isArray(list) ? list : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function writeSavedMapsRaw(list) {
+    try {
+        localStorage.setItem(SAVED_MAPS_KEY, JSON.stringify(list));
+    } catch (e) {
+        // Storage full/unavailable (private browsing, quota, etc) - importing
+        // and playing still works, it just won't be remembered next time.
+        showToast("Couldn't save this map in your browser for next time (storage full or unavailable).");
+    }
+}
+
+function generateMapId() {
+    return 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// Saves/updates `diagram` (a full diagram object, meta included) in the
+// saved-map library. If a saved map with the same name already exists it's
+// overwritten in place (keeping its id) rather than creating a duplicate.
+function saveMapToLibrary(diagram, fallbackName) {
+    let meta = (diagram && diagram.meta && typeof diagram.meta === 'object') ? diagram.meta : {};
+    let name = (meta.name && meta.name.trim()) || fallbackName || 'Untitled map';
+    let list = loadSavedMapsRaw();
+    let existingIdx = list.findIndex(m => (m.name || '').trim().toLowerCase() === name.trim().toLowerCase());
+    let entry = {
+        id: existingIdx >= 0 ? list[existingIdx].id : generateMapId(),
+        name: name,
+        description: meta.description || '',
+        startTime: meta.startTime || DEFAULT_START_TIME,
+        savedAt: Date.now(),
+        diagram: diagram
+    };
+    if (existingIdx >= 0) list[existingIdx] = entry;
+    else list.unshift(entry);
+    list.sort((a, b) => b.savedAt - a.savedAt);
+    if (list.length > SAVED_MAPS_MAX) list = list.slice(0, SAVED_MAPS_MAX);
+    writeSavedMapsRaw(list);
+    renderSavedMapsList();
+    return entry.id;
+}
+
+function deleteSavedMap(id) {
+    let list = loadSavedMapsRaw().filter(m => m.id !== id);
+    writeSavedMapsRaw(list);
+    renderSavedMapsList();
+}
+
+function loadSavedMapById(id) {
+    if (window.MP && MP.active) { showToast('Map import is disabled during multiplayer.'); return; }
+    let entry = loadSavedMapsRaw().find(m => m.id === id);
+    if (!entry) { showToast('That saved map is gone.'); return; }
+    loadDiagram(entry.diagram);
+    showToast('Loaded "' + entry.name + '".');
+}
+
+function renderSavedMapsList() {
+    let container = document.getElementById('mp-saved-maps-list');
+    if (!container) return;
+    let list = loadSavedMapsRaw();
+    container.innerHTML = '';
+    if (list.length === 0) {
+        let note = document.createElement('div');
+        note.className = 'mp-map-empty-note';
+        note.textContent = 'No saved maps yet \u2014 import one above.';
+        container.appendChild(note);
+        return;
+    }
+    for (let entry of list) {
+        let row = document.createElement('div');
+        row.className = 'mp-map-row';
+
+        let main = document.createElement('div');
+        main.className = 'mp-map-row-main';
+        let nameEl = document.createElement('div');
+        nameEl.className = 'mp-map-name';
+        nameEl.textContent = entry.name;
+        main.appendChild(nameEl);
+        if (entry.description) {
+            let descEl = document.createElement('div');
+            descEl.className = 'mp-map-desc';
+            descEl.textContent = entry.description;
+            main.appendChild(descEl);
+        }
+        row.appendChild(main);
+
+        let actions = document.createElement('div');
+        actions.className = 'mp-map-row-actions';
+        let loadBtn = document.createElement('button');
+        loadBtn.className = 'btn btn-sm mp-map-load-btn';
+        loadBtn.textContent = 'Load';
+        loadBtn.addEventListener('click', () => loadSavedMapById(entry.id));
+        let delBtn = document.createElement('button');
+        delBtn.className = 'btn btn-sm btn-danger';
+        delBtn.title = 'Remove from saved maps';
+        delBtn.textContent = '\u00d7';
+        delBtn.addEventListener('click', () => deleteSavedMap(entry.id));
+        actions.appendChild(loadBtn);
+        actions.appendChild(delBtn);
+        row.appendChild(actions);
+
+        container.appendChild(row);
+    }
+}
+
+function updateMainMenuMapStatus() {
+    let el = document.getElementById('mp-main-mapstatus');
+    if (!el) return;
+    if (hasLoadedDiagram) {
+        let pts = (state.points || []).length;
+        let tracks = (state.tracks || []).length;
+        let name = state.meta && state.meta.name ? state.meta.name : 'Untitled map';
+        el.textContent = name + ' \u2713 (' + pts + ' points, ' + tracks + ' tracks)';
+        el.classList.add('ok');
+    } else {
+        el.textContent = 'No diagram loaded yet.';
+        el.classList.remove('ok');
+    }
+}
+
+document.getElementById('mp-main-import').addEventListener('click', () => {
+    if (window.MP && MP.active) { showToast('Map import is disabled during multiplayer.'); return; }
+    document.getElementById('import-file').click();
+});
+window.addEventListener('diagram-loaded', updateMainMenuMapStatus);
 
 const importInput = document.getElementById('import-file');
 document.getElementById('btn-import-trigger').addEventListener('click', () => {
@@ -3714,3 +3894,5 @@ window.addEventListener('resize', resizeCanvas);
 setEmptyStateVisible(true);
 setHint(defaultHint());
 resizeCanvas();
+renderSavedMapsList();
+updateMainMenuMapStatus();

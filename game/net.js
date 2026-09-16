@@ -504,7 +504,8 @@ const MP = {
             type: 'MAP_DATA',
             diagram: {
                 points: state.points, tracks: state.tracks, platforms: state.platforms,
-                signals: state.signals, labels: state.labels, lines: state.lines, demand: state.demand
+                signals: state.signals, labels: state.labels, lines: state.lines, demand: state.demand,
+                meta: state.meta
             }
         }, peerId);
     },
@@ -1037,7 +1038,8 @@ const UI = {
         if (hasLoadedDiagram) {
             let pts = (state.points || []).length;
             let tracks = (state.tracks || []).length;
-            el.textContent = `Map loaded \u2713 (${pts} points, ${tracks} tracks)`;
+            let name = (state.meta && state.meta.name) ? state.meta.name : 'Map loaded';
+            el.textContent = `${name} \u2713 (${pts} points, ${tracks} tracks)`;
             el.classList.add('ok');
         } else {
             el.textContent = 'No diagram loaded yet.';

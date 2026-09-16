@@ -1,5 +1,11 @@
 /** 
  * Data Structures
+ * Meta: { name: string, description: string, startTime: "HH:MM" }
+ *   - name/description are freeform, shown in the Game's map-select screen.
+ *   - startTime is the time-of-day (24h) the in-game simulation clock starts
+ *     at when this diagram is loaded in the Game. Older diagrams exported
+ *     before this field existed are migrated on import to sensible defaults
+ *     (see the import handler), so they keep working unchanged.
  * Points: { id, x, y }
  * Tracks: { id, p1_id, p2_id, overpass: boolean, color: string, distance: number,
  *   speedLimit: number, isDepot: boolean,
@@ -88,6 +94,7 @@
  *       well-defined.
  */
 let state = {
+    meta: { name: '', description: '', startTime: '05:50' },
     points: [],
     tracks: [],
     platforms: [],
@@ -813,13 +820,33 @@ function openModal(title, fields, onSave) {
             wrap.appendChild(label);
             wrap.appendChild(select);
             inputs[f.key] = select;
+        } else if (f.type === 'textarea') {
+            const label = document.createElement('label');
+            label.textContent = f.label;
+            label.htmlFor = 'modal-input-' + f.key;
+
+            const input = document.createElement('textarea');
+            input.id = 'modal-input-' + f.key;
+            input.value = f.value ?? '';
+            if (f.placeholder) input.placeholder = f.placeholder;
+            input.rows = f.rows || 3;
+            // Inline styles (rather than relying on external CSS, which
+            // doesn't define a .modal-field textarea rule) so this renders
+            // consistently with the other dark-themed modal inputs.
+            input.style.cssText = 'font: inherit; font-size: 14px; padding: 6px 8px; ' +
+                'border: 1px solid #3f3f46; border-radius: 4px; background-color: #131315; ' +
+                'color: #f4f4f5; resize: vertical; width: 100%; box-sizing: border-box;';
+
+            wrap.appendChild(label);
+            wrap.appendChild(input);
+            inputs[f.key] = input;
         } else {
             const label = document.createElement('label');
             label.textContent = f.label;
             label.htmlFor = 'modal-input-' + f.key;
 
             const input = document.createElement('input');
-            input.type = (f.type === 'number') ? 'number' : 'text';
+            input.type = (f.type === 'number') ? 'number' : (f.type === 'time') ? 'time' : 'text';
             input.id = 'modal-input-' + f.key;
             input.value = f.value ?? '';
             if (f.placeholder) input.placeholder = f.placeholder;
@@ -1894,6 +1921,15 @@ document.getElementById('import-file').addEventListener('change', (event) => {
     reader.onload = function(e) {
         try {
             state = JSON.parse(e.target.result);
+            // Migrate diagrams exported before the Map Settings (name/
+            // description/start time) feature existed - default them in
+            // rather than leaving the diagram without a `meta` object.
+            if (!state.meta || typeof state.meta !== 'object') state.meta = {};
+            if (typeof state.meta.name !== 'string') state.meta.name = '';
+            if (typeof state.meta.description !== 'string') state.meta.description = '';
+            if (typeof state.meta.startTime !== 'string' || !/^\d{2}:\d{2}$/.test(state.meta.startTime)) {
+                state.meta.startTime = '05:50';
+            }
             if (!state.signals) state.signals = [];
             if (!state.platforms) state.platforms = [];
             if (!state.tracks) state.tracks = [];
@@ -1947,6 +1983,7 @@ document.getElementById('import-file').addEventListener('change', (event) => {
             demandActiveGroupId = null;
             demandActiveStationCode = null;
             refreshLineSelect();
+            updateMapSettingsButton();
             updateUI(); draw();
         } catch (err) { alert("Invalid JSON file."); }
     };
@@ -2903,3 +2940,64 @@ function draw() {
 
     ctx.restore();
 }
+
+// ============================================================
+// --- Map Settings (name / description / in-game start time) ---
+// ============================================================
+// Injected purely in JS (rather than requiring an HTML change) so this
+// works by just swapping in the new script.js, with no dependency on the
+// exact markup of the page it's dropped into. Reuses the existing generic
+// openModal() helper the rest of the Builder already relies on.
+
+(function initMapSettingsUI() {
+    const toolbar = document.getElementById('toolbar');
+    if (!toolbar) return;
+
+    const exportBtn = document.getElementById('btn-export');
+    const exportGroup = exportBtn ? exportBtn.closest('.tool-group') : null;
+
+    const group = document.createElement('div');
+    group.className = 'tool-group';
+
+    const btn = document.createElement('button');
+    btn.id = 'btn-map-settings';
+    btn.type = 'button';
+    btn.textContent = 'Map Settings';
+    btn.title = 'Set the map name, description and in-game start time';
+    btn.addEventListener('click', openMapSettingsModal);
+    group.appendChild(btn);
+
+    if (exportGroup && exportGroup.parentNode === toolbar) {
+        toolbar.insertBefore(group, exportGroup);
+    } else {
+        toolbar.appendChild(group);
+    }
+})();
+
+function openMapSettingsModal() {
+    if (!state.meta || typeof state.meta !== 'object') {
+        state.meta = { name: '', description: '', startTime: '05:50' };
+    }
+    openModal('Map Settings', [
+        { key: 'name', label: 'Map name', type: 'text', value: state.meta.name,
+            placeholder: 'e.g. Central Line' },
+        { key: 'description', label: 'Description', type: 'textarea', rows: 3,
+            value: state.meta.description,
+            placeholder: 'Shown to players when they pick this map' },
+        { key: 'startTime', label: 'In-game start time', type: 'time',
+            value: /^\d{2}:\d{2}$/.test(state.meta.startTime) ? state.meta.startTime : '05:50' }
+    ], (values) => {
+        state.meta.name = (values.name || '').trim();
+        state.meta.description = (values.description || '').trim();
+        state.meta.startTime = /^\d{2}:\d{2}$/.test(values.startTime) ? values.startTime : (state.meta.startTime || '05:50');
+        updateMapSettingsButton();
+    });
+}
+
+function updateMapSettingsButton() {
+    const btn = document.getElementById('btn-map-settings');
+    if (!btn) return;
+    const name = (state.meta && state.meta.name) ? state.meta.name.trim() : '';
+    btn.textContent = name ? ('Map Settings: ' + name) : 'Map Settings';
+}
+updateMapSettingsButton();

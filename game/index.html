@@ -609,6 +609,48 @@
   .mp-mapstatus-row span.ok{ color: var(--text); }
   .mp-mapstatus-row .btn{ margin-bottom: 0; flex: none; }
 
+  .mp-map-list{
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 220px;
+    overflow-y: auto;
+    margin-bottom: 16px;
+  }
+  .mp-map-row{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px 10px;
+  }
+  .mp-map-row-main{ min-width: 0; flex: 1; }
+  .mp-map-name{
+    font-size: 13px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mp-map-desc{
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 2px;
+  }
+  .mp-map-row-actions{ display: flex; gap: 6px; flex: none; }
+  .mp-map-row-actions .btn{ margin-bottom: 0; padding: 5px 9px; font-size: 12px; }
+  .mp-map-empty-note{
+    font-size: 12px;
+    color: var(--muted);
+    font-style: italic;
+    margin-bottom: 16px;
+  }
+
   .mp-roomcode-row{
     display: flex;
     align-items: center;
@@ -823,6 +865,10 @@
   .mp-active #mp-hostsetup-import{
     display: none !important;
   }
+  .mp-active #mp-main-import,
+  .mp-active .mp-map-row-actions .mp-map-load-btn{
+    display: none !important;
+  }
 </style>
 </head>
 <body>
@@ -898,6 +944,14 @@
     <div class="mp-card" id="mp-screen-main">
       <h1>TrainSig</h1>
       <p>Play solo, or host / join a live multiplayer session.</p>
+
+      <span class="mp-field-label">Map</span>
+      <div class="mp-mapstatus-row">
+        <span id="mp-main-mapstatus">No diagram loaded yet.</span>
+        <button class="btn btn-sm" id="mp-main-import">Import Map</button>
+      </div>
+      <div class="mp-map-list" id="mp-saved-maps-list"></div>
+
       <button class="btn btn-primary btn-full" id="mp-btn-singleplayer">Singleplayer</button>
       <button class="btn btn-full" id="mp-btn-multiplayer">Multiplayer</button>
     </div>
@@ -1082,7 +1136,7 @@
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="game.js?v=16"></script>
-  <script src="net.js?v=16"></script>
+  <script src="game.js?v=17"></script>
+  <script src="net.js?v=17"></script>
 </body>
 </html>
