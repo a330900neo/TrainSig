@@ -1087,6 +1087,7 @@
       </div>
       <div class="btn-row" style="margin-bottom:8px;">
         <button class="btn" id="tp-manual-route">Manual Route&hellip;</button>
+        <button class="btn" id="tp-adjust-route" title="Tip: Shift+drag the train directly to skip this button">Adjust Route (Drag)&hellip;</button>
       </div>
       <button class="btn btn-danger btn-full" id="tp-despawn" style="display:none;">Despawn (in depot)</button>
     </div>
@@ -1105,6 +1106,7 @@
     <button class="ctx-item" id="ctx-brake">Emergency brake</button>
     <button class="ctx-item" id="ctx-reverse">Reverse / turnback</button>
     <button class="ctx-item" id="ctx-manual">Manual route&hellip;</button>
+    <button class="ctx-item" id="ctx-adjust-route" title="Tip: Shift+drag the train directly to skip this menu">Adjust route (drag)&hellip;</button>
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" id="ctx-despawn">Despawn</button>
   </div>
@@ -1136,7 +1138,7 @@
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="game.js?v=17"></script>
-  <script src="net.js?v=17"></script>
+  <script src="game.js?v=18"></script>
+  <script src="net.js?v=18"></script>
 </body>
 </html>

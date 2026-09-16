@@ -584,7 +584,13 @@ const MP = {
             case 'MANUAL_ROUTE': {
                 if (!perms.lineAndSignalControl) return;
                 let train = trains.find(t => t.id === cmd.trainId);
-                if (train) setManualTarget(train, cmd.trackId, cmd.distM);
+                if (train) setManualTarget(train, cmd.trackId, cmd.distM, cmd.waypoints || []);
+                break;
+            }
+            case 'ADJUST_ROUTE': {
+                if (!perms.lineAndSignalControl) return;
+                let train = trains.find(t => t.id === cmd.trainId);
+                if (train) applyRouteAdjustment(train, cmd.trackId, cmd.distM);
                 break;
             }
             case 'SET_TIME_WARP': {

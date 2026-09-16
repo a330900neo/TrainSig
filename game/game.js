@@ -123,7 +123,17 @@ let trains = [];
 let nextTrainSeq = 1;
 let selectedTrainId = null;
 let manualRouteArmedTrainId = null; // train awaiting a map click for a manual destination
-let manualRoutePreview = null; // { points, target, valid } - live route preview under the cursor while armed, recomputed every pointermove
+let manualRoutePreview = null; // { points, target, valid, waypoints } - live route preview under the cursor while armed, recomputed every pointermove
+let manualRouteWaypoints = []; // [{trackId, dist}, ...] mid-points dropped with right-click while armed, in order, before the final left-click target
+
+// --- "Adjust Route" (drag-a-midpoint) state - lets the player bend a
+// train's ALREADY-committed route (line or manual) through one new point
+// without changing its final target, by pressing/dragging anywhere on the
+// map. See armAdjustRoute/updateAdjustRoutePreview/finishAdjustRouteDrag.
+let adjustRouteArmedTrainId = null; // train awaiting a drag to bend its existing route
+let adjustRouteDragging = false; // true from pointerdown to pointerup while armed
+let adjustDragPointerId = null; // the pointerId that owns the current adjust-drag
+let adjustRoutePreview = null; // { points, target, valid, waypointTrackId, waypointDist } - live preview of the bent route
 let gameOver = false;
 let crashAnim = null; // active crash camera/tilt animation - see triggerGameOver() and draw()
 let crashEventId = 0;
@@ -593,6 +603,49 @@ function computeTrainRoute(train, targetTrackId, targetDist) {
     }
 
     return { edges, directOnCurrent: false, totalMeters: dist.get(goalKey) };
+}
+
+// Chains computeTrainRoute across a sequence of waypoints, so a route can be
+// made to pass through one or more player-chosen mid-points on its way to a
+// final destination (the last entry in `waypoints`). Each leg is solved
+// independently: after reaching waypoint N, a lightweight "virtual train"
+// standing exactly there (same trick as updateManualRoutePreview's
+// virtualTrain) becomes the starting point for the leg to waypoint N+1. The
+// resulting edge lists are just concatenated - each leg's edges already
+// start right after the previous leg's arrival track, so there's never any
+// overlap or duplication between legs. Returns null (whole chain rejected)
+// if ANY leg turns out to be unreachable, rather than silently truncating
+// the route partway to a point the player never asked to stop at.
+//
+// `baseState` only needs the same fields computeTrainRoute itself reads off
+// a train: headTrackId, headForward, headDist, and homeDepotTrackId (used
+// only by isTurnbackTrack). Passing the real train object works fine too.
+function computeChainedRoute(baseState, waypoints) {
+    if (!waypoints || !waypoints.length) return null;
+    let combinedEdges = [];
+    let virt = {
+        headTrackId: baseState.headTrackId,
+        headForward: baseState.headForward,
+        headDist: baseState.headDist,
+        homeDepotTrackId: baseState.homeDepotTrackId
+    };
+    for (let wp of waypoints) {
+        let route = computeTrainRoute(virt, wp.trackId, wp.dist);
+        if (!route) return null;
+        combinedEdges = combinedEdges.concat(route.edges);
+        let arrivalForward = route.directOnCurrent ? virt.headForward : route.edges[route.edges.length - 1].forward;
+        virt = { headTrackId: wp.trackId, headForward: arrivalForward, headDist: wp.dist, homeDepotTrackId: baseState.homeDepotTrackId };
+    }
+    return { edges: combinedEdges, finalForward: virt.headForward };
+}
+
+// World-space (x, y) of a {trackId, dist} waypoint, for drawing its marker
+// dot. Mirrors pointAtMeters but takes a plain waypoint object rather than a
+// live train, since preview waypoints aren't attached to any track object.
+function waypointToXY(wp) {
+    let t = getTrack(wp.trackId);
+    if (!t) return null;
+    return pointAtMeters(t, wp.dist);
 }
 
 // A platform is just a marker point (t_dist) - it has no length of its own,
@@ -1426,16 +1479,23 @@ function updateManualRoutePreview(wx, wy) {
     let train = trains.find(t => t.id === manualRouteArmedTrainId);
     if (!train) { manualRoutePreview = null; return; }
 
+    let wpMarkers = manualRouteWaypoints.map(waypointToXY).filter(Boolean);
+
     let hit = getNearestTrackPoint(wx, wy, null);
     if (!hit || hit.dist >= 40) {
-        manualRoutePreview = { points: [], target: null, valid: false };
+        manualRoutePreview = { points: [], target: null, valid: false, waypoints: wpMarkers };
         return;
     }
 
     let distM = pxToMeters(hit.track, hit.t_px);
-    let route = computeTrainRoute(train, hit.track.id, distM);
-    if (!route) {
-        manualRoutePreview = { points: [], target: { x: hit.x, y: hit.y }, valid: false };
+    // Chain through any mid-points already dropped with right-click, then on
+    // to wherever the cursor is right now, so the preview always shows the
+    // FULL path the train would take if the player committed at this exact
+    // cursor position.
+    let full = manualRouteWaypoints.concat([{ trackId: hit.track.id, dist: distM }]);
+    let chained = computeChainedRoute(train, full);
+    if (!chained) {
+        manualRoutePreview = { points: [], target: { x: hit.x, y: hit.y }, valid: false, waypoints: wpMarkers };
         return;
     }
 
@@ -1447,29 +1507,58 @@ function updateManualRoutePreview(wx, wy) {
         headTrackId: train.headTrackId,
         headForward: train.headForward,
         headDist: train.headDist,
-        route: route.edges,
+        route: chained.edges,
         targetTrackId: hit.track.id,
         targetDist: distM
     };
-    manualRoutePreview = { points: getTrainPathPoints(virtualTrain), target: { x: hit.x, y: hit.y }, valid: true };
+    manualRoutePreview = { points: getTrainPathPoints(virtualTrain), target: { x: hit.x, y: hit.y }, valid: true, waypoints: wpMarkers };
 }
 
-function setManualTarget(train, trackId, distM) {
+// `waypoints` (optional) is an ordered list of {trackId, dist} mid-points
+// the route must pass through before finally reaching (trackId, distM) -
+// see armManualRoute/computeChainedRoute. Omitted/empty behaves exactly as
+// before: a single direct pathfind straight to the target.
+function setManualTarget(train, trackId, distM, waypoints) {
+    waypoints = waypoints || [];
     if (window.MP && MP.active && !MP.isHost) {
         if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
-        MP.sendInput({ type: 'MANUAL_ROUTE', trainId: train.id, trackId, distM });
+        MP.sendInput({ type: 'MANUAL_ROUTE', trainId: train.id, trackId, distM, waypoints });
         return;
     }
-    let route = computeTrainRoute(train, trackId, distM);
-    if (!route) { showToast('No route to that point.'); return; }
-    train.route = route.edges;
+    let chained = computeChainedRoute(train, waypoints.concat([{ trackId, dist: distM }]));
+    if (!chained) { showToast('No route to that point.'); return; }
+    train.route = chained.edges;
     train.targetTrackId = trackId;
     train.targetDist = distM;
-    train.targetForward = route.directOnCurrent ? train.headForward : route.edges[route.edges.length - 1].forward;
+    train.targetForward = chained.finalForward;
     train.mode = 'manual';
     train.pendingStop = null;
     train.dwellUntil = null;
-    showToast(train.label + ' routed manually.');
+    showToast(train.label + ' routed manually' + (waypoints.length ? (' via ' + waypoints.length + ' mid-point' + (waypoints.length > 1 ? 's' : '')) : '') + '.');
+}
+
+// Re-solves an ALREADY-committed route (line or manual) so it passes through
+// one new mid-point on its way to the exact same final target - the target,
+// mode, line assignment and pending-stop bookkeeping are all left untouched,
+// only `route`/`targetForward` are replaced. This is deliberately separate
+// from setManualTarget: bending a line train's path shouldn't knock it out
+// of service or stop it dwelling/continuing normally once it arrives - see
+// armAdjustRoute/finishAdjustRouteDrag.
+function applyRouteAdjustment(train, waypointTrackId, waypointDist) {
+    if (window.MP && MP.active && !MP.isHost) {
+        if (!MP.can('lineAndSignalControl')) { showToast("You don't have permission to control trains."); return; }
+        MP.sendInput({ type: 'ADJUST_ROUTE', trainId: train.id, trackId: waypointTrackId, distM: waypointDist });
+        return;
+    }
+    if (train.targetTrackId == null) { showToast(train.label + ' has no active route to adjust.'); return; }
+    let chained = computeChainedRoute(train, [
+        { trackId: waypointTrackId, dist: waypointDist },
+        { trackId: train.targetTrackId, dist: train.targetDist }
+    ]);
+    if (!chained) { showToast('No legal path through that point.'); return; }
+    train.route = chained.edges;
+    train.targetForward = chained.finalForward;
+    showToast(train.label + '\u2019s route adjusted.');
 }
 
 // Physically flips a train's heading in place - its body reverses along the
@@ -2484,6 +2573,75 @@ function draw() {
             ctx.fill();
             ctx.restore();
         }
+
+        // Mid-points already dropped with right-click - small solid amber
+        // flags, distinct from both the live cyan cursor target above and
+        // the final amber committed-route overlay, so they read as "already
+        // locked in" way-points rather than the thing currently under the
+        // pointer.
+        if (manualRoutePreview.waypoints && manualRoutePreview.waypoints.length) {
+            for (let wpt of manualRoutePreview.waypoints) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(wpt.x, wpt.y, 6, 0, Math.PI * 2);
+                ctx.fillStyle = '#fbbf24';
+                ctx.fill();
+                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+    }
+
+    // 5d. Adjust-route drag preview - while armed, shows the alternate path
+    // the train would take by bending through wherever the pointer is right
+    // now, on its way to the SAME final target it already had. Violet
+    // styling keeps it visually distinct from both the cyan pick-preview
+    // (5c) and the amber committed-route overlay (5b).
+    if (adjustRouteArmedTrainId && adjustRoutePreview) {
+        let pts = adjustRoutePreview.points;
+        if (adjustRoutePreview.valid && pts.length >= 2) {
+            ctx.save();
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+
+            ctx.shadowBlur = 0;
+            ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+            ctx.lineWidth = 8;
+            ctx.stroke();
+
+            ctx.shadowColor = '#a78bfa';
+            ctx.shadowBlur = 14 * glowZoom;
+            ctx.strokeStyle = 'rgba(167,139,250,0.6)';
+            ctx.lineWidth = 6;
+            ctx.setLineDash([12, 10]);
+            ctx.lineDashOffset = -((nowMs / 1000) * 70 * glowZoom) % 22;
+            ctx.stroke();
+
+            ctx.shadowBlur = 8 * glowZoom;
+            ctx.strokeStyle = '#ede9fe';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        if (adjustRoutePreview.target) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(adjustRoutePreview.target.x, adjustRoutePreview.target.y, 8, 0, Math.PI * 2);
+            ctx.strokeStyle = adjustRoutePreview.valid ? '#a78bfa' : '#ef4444';
+            ctx.lineWidth = 2.5;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(adjustRoutePreview.target.x, adjustRoutePreview.target.y, 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = adjustRoutePreview.valid ? '#a78bfa' : '#ef4444';
+            ctx.fill();
+            ctx.restore();
+        }
     }
 
     // 6. Trains
@@ -2900,10 +3058,50 @@ let hoverTrainId = null;
 
 canvas.addEventListener('pointerdown', (e) => {
     if (gameOver) return;
+    // The right mouse button is handled entirely by the 'contextmenu'
+    // listener below (context menu, or dropping a manual-route mid-point) -
+    // letting it also fall through into the normal left-click/drag pipeline
+    // here would fire a spurious click/adjust-drag on release right after
+    // the contextmenu handler runs.
+    if (e.button === 2) return;
     const rect = canvas.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const wPos = screenToWorld(sx, sy);
+
+    // Adjust-route mode takes the pointer over entirely for a press-drag-
+    // release gesture - it never pans the camera or selects anything else
+    // while armed, since the whole point is to bend the armed train's route
+    // through wherever the pointer ends up.
+    if (adjustRouteArmedTrainId) {
+        adjustRouteDragging = true;
+        adjustDragPointerId = e.pointerId;
+        canvas.setPointerCapture(e.pointerId);
+        updateAdjustRoutePreview(wPos.x, wPos.y);
+        draw();
+        return;
+    }
+
+    // Shift+drag straight on a train is a shortcut into adjust-route mode -
+    // arms it and starts the bend-drag in this same gesture, so the player
+    // doesn't have to select the train and press "Adjust route" first.
+    if (e.shiftKey && !manualRouteArmedTrainId) {
+        let shiftHitTrain = hitTestTrain(wPos.x, wPos.y);
+        if (shiftHitTrain) {
+            if (shiftHitTrain.targetTrackId == null) {
+                showToast(shiftHitTrain.label + ' has no active route to adjust.');
+                return;
+            }
+            armAdjustRoute(shiftHitTrain);
+            adjustRouteDragging = true;
+            adjustDragPointerId = e.pointerId;
+            canvas.setPointerCapture(e.pointerId);
+            setHint('Drag to bend ' + shiftHitTrain.label + '\u2019s route \u00B7 release to confirm');
+            updateAdjustRoutePreview(wPos.x, wPos.y);
+            draw();
+            return;
+        }
+    }
 
     pointerDownScreen = { x: sx, y: sy };
     pointerDownSignal = hitTestSignal(wPos.x, wPos.y);
@@ -2931,6 +3129,17 @@ canvas.addEventListener('pointermove', (e) => {
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     mpCursorWorld = screenToWorld(sx, sy); // multiplayer: track for cursor broadcast
+
+    // Adjust-route drag in progress: recompute the bent-route preview under
+    // the pointer every move, same idea as the manual-route pick preview
+    // below but targeting the train's EXISTING destination instead of a new
+    // one.
+    if (adjustRouteDragging && e.pointerId === adjustDragPointerId) {
+        const wPos = screenToWorld(sx, sy);
+        updateAdjustRoutePreview(wPos.x, wPos.y);
+        draw();
+        return;
+    }
 
     // A real drag/pan cancels an in-progress emergency-brake hold - holding
     // still is part of the gesture, panning the view is a different intent.
@@ -2969,7 +3178,8 @@ canvas.addEventListener('pointermove', (e) => {
     }
 
     if (changed) {
-        canvas.style.cursor = hit ? 'pointer' : (manualRouteArmedTrainId ? 'crosshair' : (trainHit ? 'pointer' : 'grab'));
+        let shiftAdjustHover = e.shiftKey && trainHit && trainHit.targetTrackId != null;
+        canvas.style.cursor = hit ? 'pointer' : ((manualRouteArmedTrainId || adjustRouteArmedTrainId || shiftAdjustHover) ? 'crosshair' : (trainHit ? 'pointer' : 'grab'));
         draw();
     }
 });
@@ -3002,16 +3212,20 @@ function handleCanvasClick(sx, sy, clientX, clientY) {
 
     if (pointerDownSignal) { toggleSignal(pointerDownSignal); return; }
 
-    // Manual-route picking mode takes priority over everything else.
+    // Manual-route picking mode takes priority over everything else. A
+    // left-click here always FINALIZES the route (through any mid-points
+    // already dropped with right-click - see the contextmenu handler below).
     if (manualRouteArmedTrainId) {
         let train = trains.find(t => t.id === manualRouteArmedTrainId);
+        let waypoints = manualRouteWaypoints;
         manualRouteArmedTrainId = null;
         manualRoutePreview = null;
+        manualRouteWaypoints = [];
         setHint(defaultHint());
         if (!train) { draw(); return; }
         let hit = getNearestTrackPoint(wPos.x, wPos.y, null);
         if (hit && hit.dist < 40) {
-            setManualTarget(train, hit.track.id, pxToMeters(hit.track, hit.t_px));
+            setManualTarget(train, hit.track.id, pxToMeters(hit.track, hit.t_px), waypoints);
         } else {
             showToast('No track near that point - route cancelled.');
         }
@@ -3043,8 +3257,39 @@ function handleCanvasClick(sx, sy, clientX, clientY) {
     closeTrainPanel();
 }
 
-canvas.addEventListener('pointerup', endPan);
-canvas.addEventListener('pointercancel', endPan);
+// Finishes an adjust-route drag: solves the bent path one last time at the
+// release point and, if legal, commits it via applyRouteAdjustment (leaving
+// the train's target/mode/line untouched - only its route bends).
+function finishAdjustRouteDrag() {
+    let train = trains.find(t => t.id === adjustRouteArmedTrainId);
+    let preview = adjustRoutePreview;
+    adjustRouteArmedTrainId = null;
+    adjustRouteDragging = false;
+    adjustDragPointerId = null;
+    adjustRoutePreview = null;
+    setHint(defaultHint());
+    canvas.style.cursor = 'grab';
+    if (!train) { draw(); return; }
+    if (!preview || !preview.valid || preview.waypointTrackId == null) {
+        showToast('Route adjustment cancelled.');
+        draw();
+        return;
+    }
+    applyRouteAdjustment(train, preview.waypointTrackId, preview.waypointDist);
+    if (selectedTrainId === train.id) updateTrainPanel();
+    draw();
+}
+
+function handlePointerUp(e) {
+    if (adjustRouteDragging && e.pointerId === adjustDragPointerId) {
+        finishAdjustRouteDrag();
+        return;
+    }
+    endPan(e);
+}
+
+canvas.addEventListener('pointerup', handlePointerUp);
+canvas.addEventListener('pointercancel', handlePointerUp);
 canvas.addEventListener('pointerleave', () => {
     mpCursorWorld = null; // multiplayer: stop broadcasting a stale position
     if (isPanning) return;
@@ -3068,7 +3313,10 @@ canvas.addEventListener('wheel', (e) => {
 canvas.style.cursor = 'grab';
 
 // Right-click opens the train context menu when over a train; otherwise it's
-// suppressed everywhere (native menu would interrupt the app).
+// suppressed everywhere (native menu would interrupt the app) - EXCEPT while
+// a manual route is armed, where right-click instead drops a mid-point
+// waypoint at the cursor (see armManualRoute). Left-click still finalizes
+// the route through whatever mid-points were dropped this way.
 document.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     if (gameOver) return;
@@ -3077,6 +3325,37 @@ document.addEventListener('contextmenu', (e) => {
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const wPos = screenToWorld(sx, sy);
+
+    if (manualRouteArmedTrainId) {
+        let train = trains.find(t => t.id === manualRouteArmedTrainId);
+        if (!train) {
+            manualRouteArmedTrainId = null;
+            manualRoutePreview = null;
+            manualRouteWaypoints = [];
+            setHint(defaultHint());
+            return;
+        }
+        let hit = getNearestTrackPoint(wPos.x, wPos.y, null);
+        if (!hit || hit.dist >= 40) { showToast('No track near that point.'); return; }
+        let distM = pxToMeters(hit.track, hit.t_px);
+        // Validate the FULL chain (existing mid-points + this new one) is
+        // still reachable before locking it in, so a wildly unreachable
+        // right-click can't strand the player mid-route with no way to
+        // finish it.
+        let testChain = manualRouteWaypoints.concat([{ trackId: hit.track.id, dist: distM }]);
+        if (!computeChainedRoute(train, testChain)) { showToast('No legal path through that point.'); return; }
+        manualRouteWaypoints.push({ trackId: hit.track.id, dist: distM });
+        setHint('Right-click to add another mid-point, left-click ' + train.label + '\u2019s final stop \u00B7 click here to cancel');
+        updateManualRoutePreview(wPos.x, wPos.y);
+        draw();
+        return;
+    }
+
+    // Adjust-route mode is drag-only (left mouse button) - suppress the
+    // native/train context menu here too rather than letting it pop up
+    // mid-gesture.
+    if (adjustRouteArmedTrainId) return;
+
     let train = hitTestTrain(wPos.x, wPos.y);
     if (train) {
         selectTrain(train.id);
@@ -3281,13 +3560,36 @@ function linkify(msg) {
 }
 
 function defaultHint() {
-    return 'Drag to pan \u00B7 Scroll to zoom \u00B7 Click a depot track, then Spawn train \u00B7 Right-click a train for actions';
+    return 'Drag to pan \u00B7 Scroll to zoom \u00B7 Click a depot track, then Spawn train \u00B7 Right-click a train for actions \u00B7 Shift+drag a train to bend its route';
 }
 function setHint(text) {
     const hint = document.getElementById('hint');
     hint.textContent = text;
-    hint.classList.toggle('manual-mode', !!manualRouteArmedTrainId);
+    hint.classList.toggle('manual-mode', !!manualRouteArmedTrainId || !!adjustRouteArmedTrainId);
 }
+
+// The hint bar becomes clickable (see .hint.manual-mode's pointer-events)
+// while either a manual route or a route adjustment is armed, so the player
+// always has an obvious, explicit way to back out of the mode instead of
+// having to remember that clicking empty canvas also cancels it.
+document.getElementById('hint').addEventListener('click', () => {
+    if (manualRouteArmedTrainId) {
+        manualRouteArmedTrainId = null;
+        manualRoutePreview = null;
+        manualRouteWaypoints = [];
+        setHint(defaultHint());
+        canvas.style.cursor = 'grab';
+        draw();
+    } else if (adjustRouteArmedTrainId) {
+        adjustRouteArmedTrainId = null;
+        adjustRoutePreview = null;
+        adjustRouteDragging = false;
+        adjustDragPointerId = null;
+        setHint(defaultHint());
+        canvas.style.cursor = 'grab';
+        draw();
+    }
+});
 
 function setEmptyStateVisible(visible) {
     document.getElementById('empty-state').style.display = visible ? 'flex' : 'none';
@@ -3390,6 +3692,7 @@ function updateTrainPanel() {
 
     document.getElementById('tp-brake').textContent = train.emergencyBrake ? 'Release Brake' : 'Emergency Brake';
     document.getElementById('tp-reverse').disabled = train.speedMs > TRAIN_STOPPED_MS;
+    document.getElementById('tp-adjust-route').disabled = (train.targetTrackId == null);
     document.getElementById('tp-despawn').style.display = isTrainFullyInHomeDepot(train) ? '' : 'none';
 }
 
@@ -3511,6 +3814,11 @@ document.getElementById('tp-manual-route').addEventListener('click', () => {
     if (!train) return;
     armManualRoute(train);
 });
+document.getElementById('tp-adjust-route').addEventListener('click', () => {
+    let train = trains.find(t => t.id === selectedTrainId);
+    if (!train) return;
+    armAdjustRoute(train);
+});
 document.getElementById('tp-despawn').addEventListener('click', () => {
     let train = trains.find(t => t.id === selectedTrainId);
     if (!train) return;
@@ -3520,8 +3828,64 @@ document.getElementById('tp-despawn').addEventListener('click', () => {
 function armManualRoute(train) {
     manualRouteArmedTrainId = train.id;
     manualRoutePreview = null;
-    setHint('Click anywhere on a track to route ' + train.label + ' there \u00B7 click here to cancel');
+    manualRouteWaypoints = [];
+    setHint('Left-click to route ' + train.label + ' there \u00B7 right-click first to add a mid-point \u00B7 click here to cancel');
     canvas.style.cursor = 'crosshair';
+}
+
+// Arms "Adjust Route": the next press-drag-release on the map bends the
+// train's ALREADY-committed route (whatever it's currently doing - line
+// service or a previous manual route) through wherever the drag ends up, on
+// its way to the exact same final target. Requires the train to actually
+// have an active target to bend around.
+function armAdjustRoute(train) {
+    if (train.targetTrackId == null) { showToast(train.label + ' has no active route to adjust.'); return; }
+    adjustRouteArmedTrainId = train.id;
+    adjustRoutePreview = null;
+    adjustRouteDragging = false;
+    adjustDragPointerId = null;
+    setHint('Press and drag anywhere on the map to bend ' + train.label + '\u2019s route \u00B7 click here to cancel');
+    canvas.style.cursor = 'crosshair';
+}
+
+// Recomputes the live "bent route" preview for an adjust-route drag in
+// progress - mirrors updateManualRoutePreview, but chains through the
+// train's EXISTING target instead of asking for a new one.
+function updateAdjustRoutePreview(wx, wy) {
+    let train = trains.find(t => t.id === adjustRouteArmedTrainId);
+    if (!train || train.targetTrackId == null) { adjustRoutePreview = null; return; }
+
+    let hit = getNearestTrackPoint(wx, wy, null);
+    if (!hit || hit.dist >= 40) {
+        adjustRoutePreview = { points: [], target: null, valid: false, waypointTrackId: null, waypointDist: null };
+        return;
+    }
+
+    let distM = pxToMeters(hit.track, hit.t_px);
+    let chained = computeChainedRoute(train, [
+        { trackId: hit.track.id, dist: distM },
+        { trackId: train.targetTrackId, dist: train.targetDist }
+    ]);
+    if (!chained) {
+        adjustRoutePreview = { points: [], target: { x: hit.x, y: hit.y }, valid: false, waypointTrackId: null, waypointDist: null };
+        return;
+    }
+
+    let virtualTrain = {
+        headTrackId: train.headTrackId,
+        headForward: train.headForward,
+        headDist: train.headDist,
+        route: chained.edges,
+        targetTrackId: train.targetTrackId,
+        targetDist: train.targetDist
+    };
+    adjustRoutePreview = {
+        points: getTrainPathPoints(virtualTrain),
+        target: { x: hit.x, y: hit.y },
+        valid: true,
+        waypointTrackId: hit.track.id,
+        waypointDist: distM
+    };
 }
 
 // ============================================================
@@ -3579,6 +3943,7 @@ function openContextMenu(train, clientX, clientY) {
     document.getElementById('ctx-title').textContent = train.label;
     document.getElementById('ctx-brake').textContent = train.emergencyBrake ? 'Release emergency brake' : 'Emergency brake';
     document.getElementById('ctx-reverse').disabled = train.speedMs > TRAIN_STOPPED_MS;
+    document.getElementById('ctx-adjust-route').disabled = (train.targetTrackId == null);
     document.getElementById('ctx-despawn').style.display = isTrainFullyInHomeDepot(train) ? '' : 'none';
 
     ctxMenu.classList.add('open');
@@ -3622,6 +3987,11 @@ document.getElementById('ctx-manual').addEventListener('click', () => {
     let train = trains.find(t => t.id === ctxMenuTrainId);
     closeContextMenu();
     if (train) armManualRoute(train);
+});
+document.getElementById('ctx-adjust-route').addEventListener('click', () => {
+    let train = trains.find(t => t.id === ctxMenuTrainId);
+    closeContextMenu();
+    if (train) armAdjustRoute(train);
 });
 document.getElementById('ctx-despawn').addEventListener('click', () => {
     let train = trains.find(t => t.id === ctxMenuTrainId);
@@ -3679,6 +4049,11 @@ function loadDiagram(parsed) {
     selectedTrainId = null;
     manualRouteArmedTrainId = null;
     manualRoutePreview = null;
+    manualRouteWaypoints = [];
+    adjustRouteArmedTrainId = null;
+    adjustRouteDragging = false;
+    adjustDragPointerId = null;
+    adjustRoutePreview = null;
     gameOver = false;
     crashAnim = null;
     document.getElementById('gameover-overlay').classList.add('hidden');
