@@ -293,10 +293,21 @@
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.2s, transform 0.2s;
+    max-width: min(520px, calc(100vw - 32px));
+    text-align: center;
   }
   .toast.show{
     opacity: 1;
     transform: translateX(-50%) translateY(0);
+    pointer-events: auto;
+  }
+  .toast a{
+    color: #fecaca;
+    text-decoration: underline;
+    font-weight: 600;
+  }
+  .toast a:hover{
+    color: #fff;
   }
 
   /* --- Train detail side panel --- */
@@ -759,6 +770,39 @@
   }
   .mp-hud-list.open{ display: block; }
 
+  .mp-hud-toggles{
+    display: flex;
+    gap: 6px;
+  }
+  .mp-room-panel{
+    font-size: 12px;
+  }
+  .mp-room-panel.open{
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .mp-room-panel .mp-room-row{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    color: var(--muted);
+  }
+  .mp-room-panel .mp-roomcode{
+    font-size: 15px;
+  }
+  .mp-room-relay{
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text);
+    word-break: break-all;
+    text-align: right;
+  }
+  .mp-room-panel .btn{
+    margin-bottom: 0;
+  }
+
   .mp-client-mode #tp-line-select,
   .mp-client-mode #tp-platform-select,
   .mp-client-mode #tp-speedcap,
@@ -810,8 +854,22 @@
 
   <!-- Multiplayer in-game HUD: player list + ping, collapsible -->
   <div class="mp-hud hidden" id="mp-hud">
-    <button class="mp-hud-toggle" id="mp-hud-toggle">Players &#9662;</button>
+    <div class="mp-hud-toggles">
+      <button class="mp-hud-toggle" id="mp-hud-toggle">Players &#9662;</button>
+      <button class="mp-hud-toggle" id="mp-room-toggle">Room &#9662;</button>
+    </div>
     <div class="mp-player-list mp-hud-list" id="mp-hud-list"></div>
+    <div class="mp-hud-list mp-room-panel" id="mp-room-panel">
+      <div class="mp-room-row">
+        <span>Room code</span>
+        <span class="mp-roomcode" id="mp-room-code"></span>
+      </div>
+      <div class="mp-room-row hidden" id="mp-room-relay-row">
+        <span>Relay address</span>
+        <span class="mp-room-relay" id="mp-room-relay"></span>
+      </div>
+      <button class="btn btn-sm" id="mp-room-copy">Copy invite link</button>
+    </div>
   </div>
 
   <div class="hint" id="hint">Drag to pan &middot; Scroll to zoom &middot; Click a depot track, then Spawn train</div>

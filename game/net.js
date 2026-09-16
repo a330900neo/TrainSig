@@ -368,6 +368,7 @@ const MP = {
         if (!everyoneReady) return;
         this.started = true;
         UI.hideOverlay();
+        UI.updateRoomPanel();
         document.getElementById('mp-hud').classList.remove('hidden');
         this._send({ type: 'START_GAME', simTimeSeconds, simSpeed });
     },
@@ -673,6 +674,7 @@ const MP = {
         speedSlider.value = simSpeed;
         speedLabel.textContent = simSpeed + 'x';
         UI.hideOverlay();
+        UI.updateRoomPanel();
         document.getElementById('mp-hud').classList.remove('hidden');
     },
 
@@ -682,6 +684,17 @@ const MP = {
     },
 
     applySnapshot(data) {
+        // Mid-game join: a client that connects after the host has already
+        // started never gets a START_GAME message (that was broadcast to
+        // whoever was in the room at the time) - the very first snapshot it
+        // receives IS its signal that the game is already running, so do
+        // the same UI transition _clientHandleStart does for everyone else.
+        if (!this.started) {
+            this.started = true;
+            UI.hideOverlay();
+            UI.updateRoomPanel();
+            document.getElementById('mp-hud').classList.remove('hidden');
+        }
         let receivedAt = performance.now();
         if (this._lastSnapshotReceivedAt) {
             this._snapshotBlendMs = Math.max(20, Math.min(200, receivedAt - this._lastSnapshotReceivedAt));
@@ -998,6 +1011,18 @@ const UI = {
         document.getElementById('mp-overlay').classList.add('hidden');
     },
 
+    // Populates the in-game "Room" panel with the current room code and
+    // (WAN only) relay address, so anyone - not just the host - can invite
+    // more players once the game is already running (mid-game join).
+    updateRoomPanel() {
+        document.getElementById('mp-room-code').textContent = MP.roomCode || '';
+        let isWan = MP.transport === 'wan' && !!MP.wanRelayUrl;
+        document.getElementById('mp-room-relay-row').classList.toggle('hidden', !isWan);
+        if (isWan) {
+            document.getElementById('mp-room-relay').textContent = MP.wanRelayUrl.replace(/^wss?:\/\//i, '');
+        }
+    },
+
     goUsername(nextFn) {
         this._usernameNext = nextFn;
         let saved = localStorage.getItem('trainsig_username') || '';
@@ -1252,7 +1277,8 @@ document.getElementById('mp-username-next').addEventListener('click', () => {
 
 document.getElementById('mp-lobby-start').addEventListener('click', () => MP.startGame());
 document.getElementById('mp-lobby-leave').addEventListener('click', () => MP.leaveRoom());
-document.getElementById('mp-lobby-copy').addEventListener('click', () => {
+
+function mpCopyInviteLink() {
     let url = window.location.origin + window.location.pathname + '?room=' + MP.roomCode;
     if (MP.transport === 'wan' && MP.wanRelayUrl) {
         url += '&relay=' + encodeURIComponent(MP.wanRelayUrl.replace(/^wss?:\/\//i, ''));
@@ -1261,10 +1287,15 @@ document.getElementById('mp-lobby-copy').addEventListener('click', () => {
         () => showToast('Invite link copied.'),
         () => showToast('Room code: ' + MP.roomCode)
     );
-});
+}
+document.getElementById('mp-lobby-copy').addEventListener('click', mpCopyInviteLink);
+document.getElementById('mp-room-copy').addEventListener('click', mpCopyInviteLink);
 
 document.getElementById('mp-hud-toggle').addEventListener('click', () => {
     document.getElementById('mp-hud-list').classList.toggle('open');
+});
+document.getElementById('mp-room-toggle').addEventListener('click', () => {
+    document.getElementById('mp-room-panel').classList.toggle('open');
 });
 
 // ---- Boot: invite links can pre-fill the room code (and, for WAN, the

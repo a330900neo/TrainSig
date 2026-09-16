@@ -2172,7 +2172,20 @@ function draw() {
     }
 
     // 3. Tracks (underpass first, overpass on top - same convention as Builder)
-    ctx.lineCap = 'round';
+    // Each segment is stroked with a flat 'butt' cap - sharp ends, no
+    // rounded blobs at dead ends, and no bleed past its own endpoint. That
+    // leaves a wedge-shaped gap at any bend, since two independently-capped
+    // segments don't know about each other. To close it, for every pair of
+    // tracks meeting at a point we also stroke a short two-segment "elbow"
+    // (out along each track a little way, through the shared point) with a
+    // native round line join - canvas guarantees a round join fully covers
+    // the gap at any angle, so this can't leave a seam the way separately
+    // filling a fixed-radius circle could. It's only drawn between tracks
+    // that share the same overpass/underpass layer, so an overpass
+    // segment's dark underlay never bleeds onto a connecting ground-level
+    // track at a ramp-style joint.
+    ctx.lineCap = 'butt';
+    const JOINT_STUB_LEN = 10;
     for (let pass of [false, true]) {
         for (let t of state.tracks) {
             if (!!t.overpass !== pass) continue;
@@ -2190,6 +2203,38 @@ function draw() {
             ctx.strokeStyle = t.color || DEFAULT_TRACK_COLOR;
             ctx.stroke();
         }
+
+        ctx.lineJoin = 'round';
+        for (let pt of state.points) {
+            let here = connectedTracks(pt.id).filter(t => !!t.overpass === pass);
+            if (here.length < 2) continue;
+            for (let i = 0; i < here.length; i++) {
+                for (let j = i + 1; j < here.length; j++) {
+                    let o1 = getPoint(here[i].p1_id === pt.id ? here[i].p2_id : here[i].p1_id);
+                    let o2 = getPoint(here[j].p1_id === pt.id ? here[j].p2_id : here[j].p1_id);
+                    if (!o1 || !o2) continue;
+                    let d1 = Math.hypot(o1.x - pt.x, o1.y - pt.y);
+                    let d2 = Math.hypot(o2.x - pt.x, o2.y - pt.y);
+                    if (!d1 || !d2) continue;
+                    let l1 = Math.min(JOINT_STUB_LEN, d1), l2 = Math.min(JOINT_STUB_LEN, d2);
+                    let n1x = pt.x + (o1.x - pt.x) / d1 * l1, n1y = pt.y + (o1.y - pt.y) / d1 * l1;
+                    let n2x = pt.x + (o2.x - pt.x) / d2 * l2, n2y = pt.y + (o2.y - pt.y) / d2 * l2;
+                    ctx.beginPath();
+                    ctx.moveTo(n1x, n1y);
+                    ctx.lineTo(pt.x, pt.y);
+                    ctx.lineTo(n2x, n2y);
+                    if (pass) {
+                        ctx.lineWidth = 8;
+                        ctx.strokeStyle = '#17171a';
+                        ctx.stroke();
+                    }
+                    ctx.lineWidth = TRACK_LINE_WIDTH;
+                    ctx.strokeStyle = here[i].color || DEFAULT_TRACK_COLOR;
+                    ctx.stroke();
+                }
+            }
+        }
+        ctx.lineJoin = 'miter';
     }
     ctx.lineCap = 'butt';
 
@@ -3201,10 +3246,21 @@ document.getElementById('zoom-fit').addEventListener('click', () => { fitCameraT
 
 function showToast(msg) {
     const toast = document.getElementById('toast');
-    toast.textContent = msg;
+    toast.innerHTML = linkify(msg);
     toast.classList.add('show');
     clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => toast.classList.remove('show'), 2600);
+    showToast._t = setTimeout(() => toast.classList.remove('show'), 5000);
+}
+
+// Escapes msg for safe HTML insertion, then turns any http(s):// URL into
+// a clickable link (opened in a new tab) so things like the relay's
+// certificate-warning link in WAN toasts can be tapped directly.
+function linkify(msg) {
+    const escaped = String(msg).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+    return escaped.replace(/https?:\/\/[^\s<]+[^\s<.,;:!?)]/g, (url) =>
+        '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + url + '</a>');
 }
 
 function defaultHint() {
