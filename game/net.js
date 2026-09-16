@@ -222,7 +222,7 @@ const MP = {
             console.error('Multiplayer host error:', err);
             if (!settled) {
                 showToast(this.transport === 'wan'
-                    ? "Couldn't reach the relay. Check the address and that relay.py is still running."
+                    ? "Couldn't reach the relay. Open " + this.wanRelayUrl.replace(/^wss:/i, 'https:') + " in a browser tab and click through the certificate warning first, then make sure relay.py is still running and try again."
                     : "Couldn't open a multiplayer room. Check your connection and try again.");
             } else if (this.active) {
                 showToast('A networking error occurred: ' + (err && err.type ? err.type : 'unknown'));
@@ -297,7 +297,7 @@ const MP = {
                     this.leaveRoom();
                 } else if (!connected) {
                     showToast(transport === 'wan'
-                        ? "Couldn't reach the host - check the relay address and try again."
+                        ? "Couldn't reach the host - first open " + wanRelayUrl.replace(/^wss:/i, 'https:') + " in a browser tab and click through the certificate warning, then check the relay address and try again."
                         : "Couldn't reach the host - check your connection and try again.");
                 } else if (this.active) {
                     showToast('A networking error occurred: ' + (err && err.type ? err.type : 'unknown'));
@@ -321,7 +321,7 @@ const MP = {
             setTimeout(() => {
                 if (!connected && this.active === false && this.peer === peer) {
                     showToast(transport === 'wan'
-                        ? "Couldn't reach the host - check the relay address and room code, and that relay.py is still running."
+                        ? "Couldn't reach the host - make sure you've opened " + wanRelayUrl.replace(/^wss:/i, 'https:') + " in a browser tab and clicked through the certificate warning, then check the relay address and room code, and that relay.py is still running."
                         : "Couldn't reach the host - check the room code, and that you're both online (signaling needs internet access even on a LAN).");
                 }
             }, hardMs);

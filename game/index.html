@@ -880,7 +880,7 @@
       <div id="mp-host-wan-fields" class="hidden">
         <span class="mp-field-label">Relay address</span>
         <input class="panel-input" id="mp-host-relay-input" placeholder="e.g. 203.0.113.10:8443">
-        <p class="mp-hint">Run <code style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:4px;">python relay.py</code> on this computer first &mdash; it prints an address to paste here (see HOSTING.md).</p>
+        <p class="mp-hint">Run <code style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:4px;">python relay.py</code> on this computer first &mdash; it prints an address to paste here (see HOSTING.md). Before creating the room, open <code style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:4px;">https://</code> + that address in a browser tab once and click through the certificate warning (&ldquo;Advanced&rdquo; &rarr; &ldquo;Proceed&rdquo;) &mdash; if you can't connect, this is the first thing to check.</p>
       </div>
 
       <label class="mp-check"><input type="checkbox" id="mp-host-midjoin" checked> Allow players to join mid-game</label>
@@ -901,6 +901,7 @@
       <div id="mp-join-wan-fields" class="hidden">
         <span class="mp-field-label">Relay address</span>
         <input class="panel-input" id="mp-join-relay-input" placeholder="e.g. 203.0.113.10:8443 (from the host)">
+        <p class="mp-hint">Before joining, open <code style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:4px;">https://</code> + this address in a browser tab once and click through the certificate warning (&ldquo;Advanced&rdquo; &rarr; &ldquo;Proceed&rdquo;) &mdash; if you can't connect, this is the first thing to check.</p>
       </div>
 
       <span class="mp-field-label">Room code</span>
