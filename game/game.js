@@ -2305,6 +2305,16 @@ function draw() {
         ctx.lineWidth = 2;
         ctx.fillRect(-PLAT_LENGTH / 2, -PLAT_WIDTH / 2, PLAT_LENGTH, PLAT_WIDTH);
         ctx.strokeRect(-PLAT_LENGTH / 2, -PLAT_WIDTH / 2, PLAT_LENGTH, PLAT_WIDTH);
+
+        // Number/code label - kept upright on screen no matter how the
+        // platform itself is rotated. Text shares the platform's rotated
+        // frame (translate + rotate(geom.angle) above), so past +/-90deg
+        // from horizontal it would otherwise render upside-down along with
+        // the rectangle. Flipping just the text frame by 180deg in that
+        // case cancels that out; it only swaps which offset (-6 vs 8) ends
+        // up above/below, never the reading direction of the glyphs.
+        ctx.save();
+        if (Math.cos(geom.angle) < 0) ctx.rotate(Math.PI);
         ctx.fillStyle = '#374151';
         ctx.font = '14px sans-serif';
         ctx.textAlign = 'center';
@@ -2316,6 +2326,7 @@ function draw() {
         } else {
             ctx.fillText(p.number || '', 0, 0);
         }
+        ctx.restore();
 
         // Waiting passenger count badge - drawn inside the platform footprint
         // (same rotated/translated frame as the number above it), pinned to
