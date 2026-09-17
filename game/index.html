@@ -393,6 +393,58 @@
     font-family: inherit;
     margin-bottom: 8px;
   }
+  /* Custom line-assignment dropdown (a plain <select>'s native option list
+     can't be hovered for a path preview in most browsers, so this is a
+     div-based stand-in styled to match .panel-select/.panel-input). */
+  .line-dropdown{
+    position: relative;
+  }
+  .line-dropdown-btn{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .line-dropdown-btn span:first-child{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .line-dropdown-arrow{
+    color: var(--muted);
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+  .line-dropdown-menu{
+    display: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(100% + 4px);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    max-height: 240px;
+    overflow-y: auto;
+    z-index: 20;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  }
+  .line-dropdown-menu.open{ display: block; }
+  .line-dropdown-option{
+    padding: 7px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .line-dropdown-option:hover,
+  .line-dropdown-option.hot{
+    background: rgba(59,130,246,0.18);
+  }
+  .line-dropdown-option.selected{
+    color: var(--accent);
+    font-weight: 600;
+  }
   .panel-inline{
     display: flex;
     gap: 6px;
@@ -1057,7 +1109,13 @@
 
     <div class="panel-section">
       <div class="panel-label">Line</div>
-      <select class="panel-select" id="tp-line-select"></select>
+      <div class="line-dropdown" id="tp-line-select">
+        <button type="button" class="panel-select line-dropdown-btn" id="tp-line-select-btn">
+          <span id="tp-line-select-label">(no line - manual only)</span>
+          <span class="line-dropdown-arrow">&#9662;</span>
+        </button>
+        <div class="line-dropdown-menu" id="tp-line-select-menu"></div>
+      </div>
     </div>
 
     <div class="panel-section" id="tp-platform-section" style="display:none;">

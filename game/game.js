@@ -1013,6 +1013,13 @@ function stepTrainPhysics(train, dt) {
         // forever after, with nothing left to ever recompute and release it.
         train.autoEmergencyBrake = false;
         train.speedMs = Math.max(0, train.speedMs - train.accelMs2 * dt);
+        // Actually coast forward while that speed bleeds off, instead of
+        // freezing the train's position in place - otherwise the train
+        // visually stops dead the instant it goes idle (e.g. right after
+        // being unassigned from a line mid-route) while speedMs quietly
+        // ticks down to 0 in the background with nothing on screen to show
+        // for it.
+        advanceTrainHead(train, train.speedMs * dt);
         return;
     }
 
@@ -1168,6 +1175,68 @@ function getTrainNextPathPoints(train) {
         let to = (e.trackId === chosenTrackId) ? chosenDist : (e.forward ? trackMeters(t2) : 0);
         let p = pointAtMeters(t2, to);
         if (p) pts.push(p);
+    }
+    return pts;
+}
+
+// World-space polyline points previewing the full stop-by-stop path `train`
+// would take if assigned to `line` right now, starting from its current
+// position and running through every stop on the line in order (mirrors
+// the platform-choice logic in routeTrainToLineStop/getTrainNextPathPoints,
+// generalized to chain across a whole line rather than a single leg).
+// Purely a hover preview for the line-assignment dropdown: computed fresh
+// from a virtual train state and never written back to the real train, so
+// hovering around the dropdown has zero effect on navigation.
+function getLineHoverPreviewPoints(train, line) {
+    if (!train || !line || !Array.isArray(line.stops) || line.stops.length < 2) return [];
+
+    let virt = {
+        headTrackId: train.headTrackId,
+        headDist: train.headDist,
+        headForward: train.headForward,
+        homeDepotTrackId: train.homeDepotTrackId,
+        length: train.length
+    };
+    let startTrack = getTrack(virt.headTrackId);
+    if (!startTrack) return [];
+    let pts = [];
+    let startPt = pointAtMeters(startTrack, virt.headDist);
+    if (startPt) pts.push(startPt);
+
+    for (let stop of line.stops) {
+        let plats = getStopPlatforms(stop);
+        if (!plats.length) break;
+
+        let bestRoute = null, bestLen = Infinity, chosen = null;
+        for (let p of plats) {
+            let t = getTrack(p.track_id);
+            if (!t) continue;
+            let targetM = pxToMeters(t, p.t_dist);
+            let route = computeTrainRoute(virt, p.track_id, targetM);
+            if (route && route.totalMeters < bestLen) {
+                bestLen = route.totalMeters; bestRoute = route; chosen = p;
+            }
+        }
+        if (!bestRoute) break; // rest of the line is unreachable from here - stop the preview at the last reachable stop
+
+        let chosenTrack = getTrack(chosen.track_id);
+        let arrivalForward = bestRoute.directOnCurrent ? virt.headForward : bestRoute.edges[bestRoute.edges.length - 1].forward;
+        let stopDist = platformStopDist(virt, chosenTrack, chosen, arrivalForward);
+
+        if (bestRoute.directOnCurrent) {
+            let p = pointAtMeters(chosenTrack, stopDist);
+            if (p) pts.push(p);
+        } else {
+            for (let e of bestRoute.edges) {
+                let t2 = getTrack(e.trackId);
+                if (!t2) break;
+                let to = (e.trackId === chosen.track_id) ? stopDist : (e.forward ? trackMeters(t2) : 0);
+                let p = pointAtMeters(t2, to);
+                if (p) pts.push(p);
+            }
+        }
+
+        virt = { headTrackId: chosenTrack.id, headDist: stopDist, headForward: arrivalForward, homeDepotTrackId: train.homeDepotTrackId, length: train.length };
     }
     return pts;
 }
@@ -2524,7 +2593,66 @@ function draw() {
         }
     }
 
-    // 5c. Manual-route picking preview - the path the armed train would take
+    // 5c. Line-assignment hover preview - while the player is hovering an
+    // option in the selected train's line dropdown, show the full
+    // stop-by-stop path that train would take if assigned to it right now.
+    // Distinct teal styling from both the amber "committed route" overlay
+    // above and the cyan manual-route preview below, so none of the three
+    // get confused with each other - this one hasn't been assigned to
+    // anything, it's just what-if.
+    if (lineHoverPreviewId) {
+        let previewTrain = trains.find(t => t.id === selectedTrainId);
+        let previewLine = getLine(lineHoverPreviewId);
+        if (previewTrain && previewLine) {
+            let pts = getLineHoverPreviewPoints(previewTrain, previewLine);
+            if (pts.length >= 2) {
+                ctx.save();
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+                ctx.moveTo(pts[0].x, pts[0].y);
+                for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+
+                ctx.shadowBlur = 0;
+                ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+                ctx.lineWidth = 9;
+                ctx.stroke();
+
+                ctx.shadowColor = '#2dd4bf';
+                ctx.shadowBlur = 18 * glowZoom;
+                ctx.strokeStyle = 'rgba(45,212,191,0.55)';
+                ctx.lineWidth = 7;
+                ctx.stroke();
+
+                ctx.shadowBlur = 10 * glowZoom;
+                ctx.strokeStyle = '#ccfbf1';
+                ctx.lineWidth = 2.5;
+                ctx.stroke();
+                ctx.restore();
+
+                ctx.save();
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.beginPath();
+                ctx.moveTo(pts[0].x, pts[0].y);
+                for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+                let dashLen = 12, gapLen = 20, period = dashLen + gapLen;
+                let flowSpeedPxPerSec = 70 * glowZoom;
+                let offset = -((nowMs / 1000) * flowSpeedPxPerSec) % period;
+                ctx.setLineDash([dashLen, gapLen]);
+                ctx.lineDashOffset = offset;
+                ctx.shadowColor = '#f0fdfa';
+                ctx.shadowBlur = 8 * glowZoom;
+                ctx.strokeStyle = '#f0fdfa';
+                ctx.lineWidth = 2;
+                ctx.globalAlpha = 0.9;
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+    }
+
+    // 5d. Manual-route picking preview - the path the armed train would take
     // to wherever the cursor currently is, drawn live as the pointer moves
     // and before any click commits it. Distinct cool cyan styling (vs. the
     // amber "committed route" overlay above) makes clear this is only a
@@ -3602,6 +3730,7 @@ function setEmptyStateVisible(visible) {
 function selectTrain(id) {
     selectedTrainId = id;
     document.getElementById('train-panel').classList.add('open');
+    closeLineDropdown();
     updateTrainPanel();
     draw();
 }
@@ -3609,21 +3738,59 @@ function selectTrain(id) {
 function closeTrainPanel() {
     selectedTrainId = null;
     document.getElementById('train-panel').classList.remove('open');
+    closeLineDropdown();
     draw();
 }
 
-function populateLineSelect(selectEl, train) {
-    selectEl.innerHTML = '';
-    let noneOpt = document.createElement('option');
-    noneOpt.value = '';
-    noneOpt.textContent = '(no line - manual only)';
-    selectEl.appendChild(noneOpt);
+// --- Custom line-assignment dropdown -----------------------------------
+// A plain <select>'s native option list is rendered by the OS/browser
+// chrome, so there's no reliable way to get hover events on individual
+// options in order to drive the path-preview overlay below. This is a
+// minimal div-based stand-in: a button showing the current line, and an
+// absolutely-positioned option list that behaves like a dropdown but is
+// just ordinary DOM Claude can attach mouseenter/mouseleave to.
+let lineDropdownOpen = false;
+let lineHoverPreviewId = undefined; // undefined = nothing hovered; '' = "(no line)" hovered; else a line id
+
+function closeLineDropdown() {
+    lineDropdownOpen = false;
+    lineHoverPreviewId = undefined;
+    let menu = document.getElementById('tp-line-select-menu');
+    if (menu) menu.classList.remove('open');
+}
+
+function setLineHoverPreview(lineId) {
+    if (lineHoverPreviewId === lineId) return;
+    lineHoverPreviewId = lineId;
+    draw();
+}
+
+function populateLineSelect(wrapperEl, train) {
+    let btnLabel = document.getElementById('tp-line-select-label');
+    let menu = document.getElementById('tp-line-select-menu');
+    let currentLine = train.lineId ? getLine(train.lineId) : null;
+    btnLabel.textContent = currentLine ? (currentLine.name || '(unnamed line)') : '(no line - manual only)';
+
+    menu.innerHTML = '';
+
+    let makeOption = (lineId, label) => {
+        let opt = document.createElement('div');
+        opt.className = 'line-dropdown-option' + (train.lineId === (lineId || null) ? ' selected' : '');
+        opt.textContent = label;
+        opt.addEventListener('mouseenter', () => setLineHoverPreview(lineId));
+        opt.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeLineDropdown();
+            assignLineToTrain(train, lineId || null);
+            updateTrainPanel();
+            draw();
+        });
+        return opt;
+    };
+
+    menu.appendChild(makeOption('', '(no line - manual only)'));
     for (let line of state.lines) {
-        let opt = document.createElement('option');
-        opt.value = line.id;
-        opt.textContent = line.name || '(unnamed line)';
-        if (train.lineId === line.id) opt.selected = true;
-        selectEl.appendChild(opt);
+        menu.appendChild(makeOption(line.id, line.name || '(unnamed line)'));
     }
 }
 
@@ -3660,8 +3827,10 @@ function updateTrainPanel() {
     speedEl.classList.toggle('speed-eb-flash', !!(train.emergencyBrake || train.autoEmergencyBrake));
     document.getElementById('tp-next').textContent = nextStationLabel(train);
 
-    let lineSelect = document.getElementById('tp-line-select');
-    if (document.activeElement !== lineSelect) populateLineSelect(lineSelect, train);
+    // Skip repopulating while the dropdown is open under the pointer -
+    // rebuilding its DOM mid-hover would kill the mouseenter/mouseleave
+    // state driving the path preview.
+    if (!lineDropdownOpen) populateLineSelect(document.getElementById('tp-line-select'), train);
 
     // Platform choice at next stop, when that stop has more than one platform.
     let platSection = document.getElementById('tp-platform-section');
@@ -3698,12 +3867,30 @@ function updateTrainPanel() {
 
 document.getElementById('tp-close').addEventListener('click', closeTrainPanel);
 
-document.getElementById('tp-line-select').addEventListener('change', (e) => {
-    let train = trains.find(t => t.id === selectedTrainId);
-    if (!train) return;
-    assignLineToTrain(train, e.target.value || null);
-    updateTrainPanel();
-    draw();
+document.getElementById('tp-line-select-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    lineDropdownOpen = !lineDropdownOpen;
+    if (!lineDropdownOpen) lineHoverPreviewId = undefined;
+    document.getElementById('tp-line-select-menu').classList.toggle('open', lineDropdownOpen);
+    if (lineHoverPreviewId === undefined) draw();
+});
+
+// Clears the hover preview (but leaves the dropdown open) once the pointer
+// leaves the whole option list, rather than per-option on mouseleave -
+// moving between adjacent rows would otherwise flicker the preview off and
+// back on as the browser fires the old row's mouseleave after the new
+// row's mouseenter.
+document.getElementById('tp-line-select-menu').addEventListener('mouseleave', () => {
+    setLineHoverPreview(undefined);
+});
+
+document.addEventListener('click', (e) => {
+    if (!lineDropdownOpen) return;
+    if (!document.getElementById('tp-line-select').contains(e.target)) closeLineDropdown();
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && lineDropdownOpen) closeLineDropdown();
 });
 
 function setTrainPlatform(train, platformId) {
