@@ -4190,7 +4190,51 @@ document.getElementById('ctx-despawn').addEventListener('click', () => {
 // --- Game over overlay ---
 // ============================================================
 
+// Resets the running simulation back to a fresh start on the diagram
+// that's already loaded (same points/tracks/platforms/signals/lines -
+// none of that is touched), without reloading the page. Unlike
+// loadDiagram(), this never touches MP.active/isHost/roomCode/etc, so
+// calling it mid-room doesn't drop the connection or require anyone to
+// rejoin - see the btn-restart handler and MP's REQUEST_RESTART below.
+function resetGameState() {
+    trains = [];
+    nextTrainSeq = 1;
+    selectedTrainId = null;
+    manualRouteArmedTrainId = null;
+    manualRoutePreview = null;
+    manualRouteWaypoints = [];
+    adjustRouteArmedTrainId = null;
+    adjustRouteDragging = false;
+    adjustDragPointerId = null;
+    adjustRoutePreview = null;
+    state.platforms.forEach(p => { p._waiting = {}; });
+    gameOver = false;
+    crashAnim = null;
+    document.getElementById('gameover-overlay').classList.add('hidden');
+    closeTrainPanel();
+    setHint(defaultHint());
+
+    simTimeSeconds = parseStartTimeToSeconds(state.meta.startTime);
+    setPaused(true);
+    updateClockDisplay();
+
+    draw();
+}
+
 document.getElementById('btn-restart').addEventListener('click', () => {
+    // In multiplayer, reloading the page would tear down the peer
+    // connection and force everyone back through the join screen. Reset
+    // the sim in place instead - the host does it directly and its next
+    // snapshot carries the reset to everyone else; a guest just asks the
+    // host to do it, same as any other authoritative action.
+    if (window.MP && MP.active) {
+        if (MP.isHost) {
+            resetGameState();
+        } else {
+            MP.sendInput({ type: 'REQUEST_RESTART' });
+        }
+        return;
+    }
     window.location.reload();
 });
 

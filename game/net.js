@@ -605,6 +605,15 @@ const MP = {
                 this._send({ type: 'PAUSE_UPDATE', value: simPaused });
                 break;
             }
+            case 'REQUEST_RESTART': {
+                // Not gated by a permission toggle, same as SET_PAUSED -
+                // anyone stuck looking at a crash overlay can get the room
+                // moving again. Only does anything once there's actually a
+                // crash to clear, so it can't be used to reset a live game.
+                if (!gameOver) return;
+                resetGameState();
+                break;
+            }
         }
     },
 
@@ -722,6 +731,12 @@ const MP = {
                 data.crash.tiltRad,
                 data.crash.id
             );
+        } else if (!data.crash && crashAnim) {
+            // Host restarted the sim (see REQUEST_RESTART) - drop the crash
+            // camera animation locally too, or the tilted/zoomed view from
+            // the last collision would stick around forever even though
+            // gameOver just went back to false and the overlay is hidden.
+            crashAnim = null;
         }
         let previousTrainIds = new Set(trains.map(train => train.id));
         let oldTrains = new Map(trains.map(train => [train.id, train]));
