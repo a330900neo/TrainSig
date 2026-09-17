@@ -159,6 +159,23 @@ let activeLineId = null; // which line new stops get appended to while in 'line'
 let demandActiveGroupId = null; // which demand group is selected in the Demand Editor
 let demandActiveStationCode = null; // which station's demand is being edited in the Demand Editor
 let diagonalGrid = false; // when true, grid/snap axes are rotated 45 degrees
+
+// --- Diagonal (45-degree) Track Tool state ---
+// This tool builds a pair of new track segments that continue two already
+// parallel tracks around a clean 45-degree-increment turn, while keeping the
+// perpendicular gap between them constant - something that's effectively
+// impossible to hand-place with the plain grid-snapped "Add Track" tool.
+// Flow: click an existing point on the OUTER track (diagStage 0->1), click an
+// existing point on the INNER track (diagStage 1->2), then move the mouse to
+// aim the new direction (snapped to 45-degree increments relative to the
+// existing track's direction) and click to build (stays at stage 2 so the
+// player can keep clicking to chain further turns/extensions).
+let diagStage = 0; // 0 = pick outer point, 1 = pick inner point, 2 = aim & build
+let diagOuterPoint = null;
+let diagInnerPoint = null;
+let diagPreview = null; // computed preview geometry, recalculated on mousemove
+const ORIGINAL_CANVAS_HINT = 'Right-click + drag to Pan | Scroll to Zoom | Drag a signal\'s circle to reposition it - the post leaves the track perpendicular, then routes to the head in clean 45°-ish legs | Signals are directional: the arrow shows which travel direction sees the light | In "Add Line / Stations" mode, pick a line then click platforms in order to append them as station stops - click another platform at the same station right after to add it to that stop too (e.g. a no-turnback terminus with separate arrival/departure platforms); hold Shift to force a new stop at the same station instead | Set "New Track Speed Limit" once and every track drawn with Add Track / Diagonal Track picks it up automatically, no per-track editing needed';
+
 let camera = { x: 0, y: 0, zoom: 1 };
 let isDraggingCamera = false;
 let lastMouse = { x: 0, y: 0 };
@@ -237,6 +254,185 @@ function snapPointToGrid(x, y) {
 
 function getPoint(id) { return state.points.find(p => p.id === id); }
 function getPointAt(x, y) { return state.points.find(p => p.x === x && p.y === y); }
+
+// Reads the toolbar's "New Track Speed Limit" field. Returns a number if the
+// player has set one, otherwise undefined (meaning: don't set a speed limit,
+// same as leaving the field blank in the Edit Track Info modal). Applied
+// automatically to every track created by the Add Track and Diagonal Track
+// tools so the player doesn't have to open Edit Track Info each time.
+function getDefaultSpeedLimit() {
+    let el = document.getElementById('default-speed-limit');
+    if (!el || el.value === '') return undefined;
+    let v = parseFloat(el.value);
+    return isNaN(v) ? undefined : v;
+}
+
+// --- Diagonal (45-degree) Track Tool math helpers ---
+
+function rotateVec(v, theta) {
+    let c = Math.cos(theta), s = Math.sin(theta);
+    return { x: v.x * c - v.y * s, y: v.x * s + v.y * c };
+}
+
+// Direction (unit vector) a track already connected to this point is
+// traveling as it arrives at the point - i.e. from the track's other
+// endpoint, towards this point. Used as the "straight ahead" direction to
+// build a new diagonal turn from. Returns null if the point has no track.
+function pointIncomingDir(pointId) {
+    let self = getPoint(pointId);
+    if (!self) return null;
+    let t = state.tracks.find(tr => tr.p1_id === pointId || tr.p2_id === pointId);
+    if (!t) return null;
+    let otherId = (t.p1_id === pointId) ? t.p2_id : t.p1_id;
+    let other = getPoint(otherId);
+    if (!other) return null;
+    let dx = self.x - other.x, dy = self.y - other.y;
+    let len = Math.hypot(dx, dy);
+    if (len === 0) return null;
+    return { x: dx / len, y: dy / len };
+}
+
+// Solves t*u - s*v = rhs for scalars t, s (2D line-intersection parameters).
+// Returns null if u and v are parallel (no unique intersection).
+function solveLineIntersectionParams(u, v, rhs) {
+    let det = u.x * (-v.y) - (-v.x) * u.y;
+    if (Math.abs(det) < 1e-9) return null;
+    let t = (rhs.x * (-v.y) - (-v.x) * rhs.y) / det;
+    let s = (u.x * rhs.y - u.y * rhs.x) / det;
+    return { t, s };
+}
+
+// Computes the pair of new track segments needed to extend the outer/inner
+// diagonal-tool points towards (mouseX, mouseY), turning in 45-degree
+// increments relative to the existing track direction while keeping the
+// perpendicular gap between outer and inner exactly constant. No arcs are
+// used - only straight segments, with whichever side is on the outside of
+// the turn getting an extra "extend straight, then turn" leg (a real curve
+// can't have both rails bend at the same point along the direction of
+// travel and stay parallel).
+function computeDiagonalBuild(mouseX, mouseY) {
+    if (!diagOuterPoint || !diagInnerPoint) return null;
+    let O = diagOuterPoint, I = diagInnerPoint;
+    let u = pointIncomingDir(I.id) || pointIncomingDir(O.id);
+    if (!u) return null;
+
+    let rawDx = mouseX - I.x, rawDy = mouseY - I.y;
+    if (Math.hypot(rawDx, rawDy) < 1e-6) return null;
+
+    // Snap the aimed direction to the nearest 45-degree increment relative
+    // to u, so the turn angle is always a clean multiple of 45 degrees no
+    // matter which way the existing track itself happens to be running.
+    let uAngle = Math.atan2(u.y, u.x);
+    let rawAngle = Math.atan2(rawDy, rawDx) - uAngle;
+    while (rawAngle <= -Math.PI) rawAngle += 2 * Math.PI;
+    while (rawAngle > Math.PI) rawAngle -= 2 * Math.PI;
+    let theta = Math.round(rawAngle / (Math.PI / 4)) * (Math.PI / 4);
+    let v = rotateVec(u, theta);
+
+    let p = { x: O.x - I.x, y: O.y - I.y }; // outer's offset from inner
+    let pRot = rotateVec(p, theta); // same offset, rotated - keeps the gap's magnitude
+
+    // Length of the new post-turn leg, taken from how far the cursor is
+    // dragged along v and snapped to the grid, with a one-grid-cell minimum.
+    let rawLen = rawDx * v.x + rawDy * v.y;
+    let m = Math.round(rawLen / gridSize) * gridSize;
+    if (m < gridSize) m = gridSize;
+
+    let result = { u, v, theta, m, O, I };
+
+    if (Math.abs(Math.sin(theta)) < 1e-6) {
+        // No actual turn (continuing straight, or exactly reversing) - both
+        // sides just extend directly, no elbow needed.
+        result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
+        result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
+        result.innerSegments = [{ from: I, to: result.I2 }];
+        result.outerSegments = [{ from: O, to: result.O2 }];
+        return result;
+    }
+
+    const EPS = 1e-6;
+
+    // Try "outer extends": outer's pre-turn ray from O (direction u)
+    // intersected with the post-turn line running parallel to inner's own
+    // post-turn ray, offset by the rotated gap pRot.
+    let base1 = { x: I.x + pRot.x, y: I.y + pRot.y };
+    let inter1 = solveLineIntersectionParams(u, v, { x: base1.x - O.x, y: base1.y - O.y });
+
+    if (inter1 && inter1.t > EPS) {
+        let Omid = { x: O.x + inter1.t * u.x, y: O.y + inter1.t * u.y };
+        result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
+        result.O2 = { x: Omid.x + m * v.x, y: Omid.y + m * v.y };
+        result.innerSegments = [{ from: I, to: result.I2 }];
+        result.outerSegments = [{ from: O, to: Omid }, { from: Omid, to: result.O2 }];
+        return result;
+    }
+
+    // Otherwise try "inner extends" (the turn bends towards the outer
+    // point's side, so the inner point ends up on the outside instead).
+    let base2 = { x: O.x - pRot.x, y: O.y - pRot.y };
+    let inter2 = solveLineIntersectionParams(u, v, { x: base2.x - I.x, y: base2.y - I.y });
+
+    if (inter2 && inter2.t > EPS) {
+        let Imid = { x: I.x + inter2.t * u.x, y: I.y + inter2.t * u.y };
+        result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
+        result.I2 = { x: Imid.x + m * v.x, y: Imid.y + m * v.y };
+        result.outerSegments = [{ from: O, to: result.O2 }];
+        result.innerSegments = [{ from: I, to: Imid }, { from: Imid, to: result.I2 }];
+        return result;
+    }
+
+    // Fallback (shouldn't normally happen once theta != 0): direct both ways.
+    result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
+    result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
+    result.innerSegments = [{ from: I, to: result.I2 }];
+    result.outerSegments = [{ from: O, to: result.O2 }];
+    return result;
+}
+
+// Actually commits a computeDiagonalBuild() result into state.points/tracks,
+// creating any new points needed and one track per segment. Reuses an
+// existing point at the exact same coordinates instead of creating a
+// duplicate, same convention as the plain Add Track tool.
+function commitDiagonalBuild(build) {
+    if (!build) return null;
+    let color = document.getElementById('elem-color').value || DEFAULT_TRACK_COLOR;
+    let speedLimit = getDefaultSpeedLimit();
+
+    function resolvePoint(pt) {
+        let existing = getPointAt(pt.x, pt.y);
+        if (existing) return existing;
+        let np = { id: generateId(), x: pt.x, y: pt.y };
+        state.points.push(np);
+        return np;
+    }
+
+    function buildSegments(segments) {
+        let lastPoint = null;
+        segments.forEach(seg => {
+            let fromPt = resolvePoint(seg.from);
+            let toPt = resolvePoint(seg.to);
+            if (fromPt.id === toPt.id) return;
+            let exists = state.tracks.some(t =>
+                (t.p1_id === fromPt.id && t.p2_id === toPt.id) ||
+                (t.p2_id === fromPt.id && t.p1_id === toPt.id)
+            );
+            if (!exists) {
+                let len = Math.hypot(toPt.x - fromPt.x, toPt.y - fromPt.y);
+                state.tracks.push({
+                    id: generateId(), p1_id: fromPt.id, p2_id: toPt.id,
+                    overpass: false, color, distance: Math.round(len),
+                    speedLimit, oneway: 'none'
+                });
+            }
+            lastPoint = toPt;
+        });
+        return lastPoint;
+    }
+
+    let newOuter = buildSegments(build.outerSegments);
+    let newInner = buildSegments(build.innerSegments);
+    return { outer: newOuter, inner: newInner };
+}
 
 function getTrackProjection(wx, wy) {
     let best = null;
@@ -695,8 +891,37 @@ function setMode(newMode) {
     document.querySelector(`button[data-mode="${mode}"]`).classList.add('active');
     selectedElement = null;
     trackProjection = null;
+    resetDiagTool();
     updateUI();
     draw();
+}
+
+// Resets the Diagonal Track tool back to "pick outer point" and restores the
+// canvas hint bar. Called whenever the mode changes (including re-clicking
+// the diagonal tool's own button, which doubles as a manual reset/cancel),
+// and on Escape.
+function resetDiagTool() {
+    diagStage = 0;
+    diagOuterPoint = null;
+    diagInnerPoint = null;
+    diagPreview = null;
+    updateDiagHint();
+}
+
+function updateDiagHint() {
+    let hintEl = document.getElementById('canvas-hint');
+    if (!hintEl) return;
+    if (mode !== 'diag') {
+        hintEl.textContent = ORIGINAL_CANVAS_HINT;
+        return;
+    }
+    if (diagStage === 0) {
+        hintEl.textContent = 'Diagonal Track (45°): click the OUTER track\'s connection point (the point at the end of an existing track, on the outside of the turn you plan to make)';
+    } else if (diagStage === 1) {
+        hintEl.textContent = 'Diagonal Track (45°): now click the INNER track\'s connection point (the parallel track\'s matching endpoint)';
+    } else {
+        hintEl.textContent = 'Diagonal Track (45°): move the mouse to aim (snaps to 45° turns) and click to build - the outer track extends first if needed, so the gap stays constant | Esc to restart';
+    }
 }
 
 function updateUI() {
@@ -919,6 +1144,15 @@ function cleanupOrphanPoints() {
 
 document.querySelectorAll('button[data-mode]').forEach(btn => {
     btn.addEventListener('click', (e) => setMode(e.target.dataset.mode));
+});
+
+// Escape restarts the Diagonal Track tool's point-picking (cancels whatever
+// stage it's mid-way through) without leaving diag mode entirely.
+window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && mode === 'diag') {
+        resetDiagTool();
+        draw();
+    }
 });
 
 document.getElementById('btn-overpass').addEventListener('click', () => {
@@ -2041,6 +2275,35 @@ canvas.addEventListener('mousedown', (e) => {
             isDrawing = true;
             drawStartPoint = existingPt;
         }
+        else if (mode === 'diag') {
+            let hit = findHoverElement(wPos.x, wPos.y);
+            let hitPoint = (hit && hit.type === 'point') ? getPoint(hit.id) : null;
+            if (diagStage === 0) {
+                if (hitPoint) {
+                    diagOuterPoint = hitPoint;
+                    diagStage = 1;
+                    updateDiagHint();
+                }
+            } else if (diagStage === 1) {
+                if (hitPoint && hitPoint.id !== diagOuterPoint.id) {
+                    diagInnerPoint = hitPoint;
+                    diagStage = 2;
+                    updateDiagHint();
+                }
+            } else if (diagStage === 2) {
+                let build = computeDiagonalBuild(wPos.x, wPos.y);
+                if (build) {
+                    let committed = commitDiagonalBuild(build);
+                    if (committed && committed.outer && committed.inner) {
+                        // Stay at stage 2, chained onto the freshly built
+                        // endpoints, so the player can keep clicking to lay
+                        // further 45-degree legs without re-picking points.
+                        diagOuterPoint = committed.outer;
+                        diagInnerPoint = committed.inner;
+                    }
+                }
+            }
+        }
         else if (mode === 'split' && trackProjection && trackProjection.distToMouse < 30) {
             let t = trackProjection.track;
             let len = Math.hypot(getPoint(t.p2_id).x - getPoint(t.p1_id).x, getPoint(t.p2_id).y - getPoint(t.p1_id).y);
@@ -2065,7 +2328,7 @@ canvas.addEventListener('mousedown', (e) => {
                 state.tracks.push({
                     id: t2_id, p1_id: existingPt.id, p2_id: old_p2, 
                     overpass: t.overpass, color: t.color, distance: Math.round(len2),
-                    oneway: t.oneway || 'none'
+                    speedLimit: t.speedLimit, oneway: t.oneway || 'none'
                 });
                 
                 state.platforms.forEach(p => {
@@ -2227,6 +2490,13 @@ window.addEventListener('mousemove', (e) => {
     else if (mode === 'platform' || mode === 'split' || mode === 'signal') {
         if (overCanvas) trackProjection = getTrackProjection(wPos.x, wPos.y);
     }
+    else if (mode === 'diag') {
+        if (diagStage < 2) {
+            if (overCanvas) hoverElement = findHoverElement(wPos.x, wPos.y);
+        } else {
+            diagPreview = overCanvas ? computeDiagonalBuild(wPos.x, wPos.y) : null;
+        }
+    }
     
     draw();
 });
@@ -2267,7 +2537,7 @@ window.addEventListener('mouseup', (e) => {
                 state.tracks.push({
                     id: generateId(), p1_id: drawStartPoint.id, p2_id: existingPt.id,
                     overpass: false, color: document.getElementById('elem-color').value || DEFAULT_TRACK_COLOR,
-                    distance: Math.round(len), oneway: 'none'
+                    distance: Math.round(len), speedLimit: getDefaultSpeedLimit(), oneway: 'none'
                 });
             }
         } else {
@@ -2862,17 +3132,63 @@ function draw() {
     }
 
     // 5. Draw Points
-    if (mode === 'select' || mode === 'delete') {
+    if (mode === 'select' || mode === 'delete' || mode === 'diag') {
         for (let p of state.points) {
             let isSel = (selectedElement && selectedElement.id === p.id);
             let isHov = (hoverElement && hoverElement.id === p.id);
+            let isDiagOuter = mode === 'diag' && diagOuterPoint && diagOuterPoint.id === p.id;
+            let isDiagInner = mode === 'diag' && diagInnerPoint && diagInnerPoint.id === p.id;
+            let radius = (isSel || isDiagOuter || isDiagInner) ? 6 : 4;
             ctx.beginPath();
-            ctx.arc(p.x, p.y, isSel ? 6 : 4, 0, Math.PI * 2);
+            ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
             let pCol = isSel ? '#2563eb' : '#9ca3af';
             if (mode === 'delete' && isHov) pCol = '#ef4444';
+            if (mode === 'diag') {
+                if (isDiagOuter) pCol = '#f97316'; // orange = outer
+                else if (isDiagInner) pCol = '#22c55e'; // green = inner
+                else if (isHov && diagStage < 2) pCol = '#3b82f6';
+            }
             ctx.fillStyle = pCol;
             ctx.fill();
         }
+    }
+
+    // Diagonal Track tool: live preview of the two new parallel segments
+    // (outer may show an extra elbow leg), plus the aim direction.
+    if (mode === 'diag' && diagStage === 2 && diagPreview) {
+        ctx.save();
+        ctx.lineCap = 'round';
+        const drawPreviewSeg = (seg, color) => {
+            ctx.beginPath();
+            ctx.moveTo(seg.from.x, seg.from.y);
+            ctx.lineTo(seg.to.x, seg.to.y);
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = color;
+            ctx.setLineDash([8, 5]);
+            ctx.stroke();
+        };
+        (diagPreview.outerSegments || []).forEach(seg => drawPreviewSeg(seg, 'rgba(249, 115, 22, 0.85)'));
+        (diagPreview.innerSegments || []).forEach(seg => drawPreviewSeg(seg, 'rgba(34, 197, 94, 0.85)'));
+        ctx.setLineDash([]);
+        // Mark the elbow point, if this turn needed one, so it's clear the
+        // outer (or inner) side is auto-extending to keep the gap constant.
+        (diagPreview.outerSegments || []).forEach((seg, i) => {
+            if (i === 0 && diagPreview.outerSegments.length > 1) {
+                ctx.beginPath();
+                ctx.arc(seg.to.x, seg.to.y, 5, 0, Math.PI * 2);
+                ctx.fillStyle = '#f97316';
+                ctx.fill();
+            }
+        });
+        (diagPreview.innerSegments || []).forEach((seg, i) => {
+            if (i === 0 && diagPreview.innerSegments.length > 1) {
+                ctx.beginPath();
+                ctx.arc(seg.to.x, seg.to.y, 5, 0, Math.PI * 2);
+                ctx.fillStyle = '#22c55e';
+                ctx.fill();
+            }
+        });
+        ctx.restore();
     }
 
     // Current Drawing Track
