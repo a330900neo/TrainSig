@@ -174,7 +174,14 @@ let diagStage = 0; // 0 = pick outer point, 1 = pick inner point, 2 = aim & buil
 let diagOuterPoint = null;
 let diagInnerPoint = null;
 let diagPreview = null; // computed preview geometry, recalculated on mousemove
-const ORIGINAL_CANVAS_HINT = 'Right-click + drag to Pan | Scroll to Zoom | Drag a signal\'s circle to reposition it - the post leaves the track perpendicular, then routes to the head in clean 45°-ish legs | Signals are directional: the arrow shows which travel direction sees the light | In "Add Line / Stations" mode, pick a line then click platforms in order to append them as station stops - click another platform at the same station right after to add it to that stop too (e.g. a no-turnback terminus with separate arrival/departure platforms); hold Shift to force a new stop at the same station instead | Set "New Track Speed Limit" once and every track drawn with Add Track / Diagonal Track picks it up automatically, no per-track editing needed';
+// Which side's existing point is used as the reference for "lock onto a
+// nearby parallel 45-degree track" snapping while aiming (see
+// getDiagAimPoint). Defaults to the inner point. Right-clicking during the
+// aim stage (stage 2) toggles this instead of panning the camera, so the
+// player can choose whichever side should land exactly on the grid/parallel
+// line when the two sides don't already agree pixel-for-pixel.
+let diagAnchorIsOuter = false;
+const ORIGINAL_CANVAS_HINT = 'Right-click + drag to Pan | Scroll to Zoom | Drag a signal\'s circle to reposition it - the post leaves the track perpendicular, then routes to the head in clean 45°-ish legs | Signals are directional: the arrow shows which travel direction sees the light | In "Add Line / Stations" mode, pick a line then click platforms in order to append them as station stops - click another platform at the same station right after to add it to that stop too (e.g. a no-turnback terminus with separate arrival/departure platforms); hold Shift to force a new stop at the same station instead | Set "New Track Speed Limit" once and every track drawn with Add Track / Diagonal Track picks it up automatically, no per-track editing needed | Drawing or dragging near a 45° angle snaps onto any nearby parallel 45° track so they line up cleanly instead of looking offset';
 
 let camera = { x: 0, y: 0, zoom: 1 };
 let isDraggingCamera = false;
@@ -237,6 +244,25 @@ function snapToGrid(val) {
 // Snaps a world (x,y) point to the grid. When diagonalGrid is on, the grid's
 // axes are rotated 45 degrees, so adjacent snapped points line up on a
 // diagonal - this makes drawing tracks at a clean 45-degree angle easy.
+// Finds an existing track point within grabbing distance of (x, y), in
+// world units (scaled by zoom so the tolerance feels the same at any zoom
+// level). Used so the plain "Add Track" tool can snap precisely onto a
+// point that isn't sitting on the background grid (e.g. one placed by the
+// Diagonal Track tool, or dragged) - without this, a click near such a
+// point would just grid-snap to a nearby empty grid cell and create a new,
+// disconnected point instead of joining the existing track.
+const POINT_SNAP_TOL_PX = 10;
+function findNearbyPoint(x, y, excludeId) {
+    let best = null, bestDist = Infinity;
+    let tol = POINT_SNAP_TOL_PX / camera.zoom;
+    for (let p of state.points) {
+        if (excludeId && p.id === excludeId) continue;
+        let d = Math.hypot(p.x - x, p.y - y);
+        if (d < tol && d < bestDist) { bestDist = d; best = p; }
+    }
+    return best;
+}
+
 function snapPointToGrid(x, y) {
     if (!diagonalGrid) {
         return { x: snapToGrid(x), y: snapToGrid(y) };
@@ -292,14 +318,112 @@ function pointIncomingDir(pointId) {
     return { x: dx / len, y: dy / len };
 }
 
-// Solves t*u - s*v = rhs for scalars t, s (2D line-intersection parameters).
-// Returns null if u and v are parallel (no unique intersection).
-function solveLineIntersectionParams(u, v, rhs) {
-    let det = u.x * (-v.y) - (-v.x) * u.y;
-    if (Math.abs(det) < 1e-9) return null;
-    let t = (rhs.x * (-v.y) - (-v.x) * rhs.y) / det;
-    let s = (u.x * rhs.y - u.y * rhs.x) / det;
-    return { t, s };
+// How close (in degrees) two directions need to be, treating a line and its
+// reverse as identical, before they're considered "the same line's angle" for
+// the snapping helpers below.
+const DIR_SNAP_TOL_DEG = 6;
+
+// Angle between two directions, collapsed to a 0-90 degree range since a
+// track's "direction" has no meaningful sign (p1->p2 and p2->p1 are the same
+// line). Used to decide whether two tracks are close enough to parallel to
+// treat as intentionally-aligned.
+function angleBetweenDirsDeg(a, b) {
+    let dot = Math.max(-1, Math.min(1, Math.abs(a.x * b.x + a.y * b.y)));
+    return Math.acos(dot) * 180 / Math.PI;
+}
+
+// If `dir` is within DIR_SNAP_TOL_DEG of an exact 45-degree increment, returns
+// the exact unit vector at that increment. Otherwise returns null (the
+// direction is left alone rather than forced onto a nearby-but-wrong angle).
+function snapDirToNearest45(dir) {
+    if (!dir) return null;
+    let angle = Math.atan2(dir.y, dir.x);
+    let step = Math.PI / 4;
+    let snapped = Math.round(angle / step) * step;
+    let diffDeg = Math.abs(angle - snapped) * 180 / Math.PI;
+    if (diffDeg > DIR_SNAP_TOL_DEG) return null;
+    return { x: Math.cos(snapped), y: Math.sin(snapped) };
+}
+
+// Smart "same line" snapping for freehand 45-degree-ish drawing/dragging,
+// mirroring the precision platforms and signals get from being locked to
+// their track: if the segment from `anchor` towards the raw cursor position
+// is close to a 45-degree increment, AND an already-built track runs along
+// (near enough to) that same line, the far endpoint is pulled to sit exactly
+// on that existing line instead of drifting a few pixels off it. Without
+// this, two hand-drawn 45-degree tracks that were "meant" to be one
+// continuous line commonly end up a pixel or two apart - looking subtly
+// offset/kinked instead of forming one clean diagonal. Returns the snapped
+// {x, y} point, or null if no snap applies (caller should fall back to plain
+// grid snapping).
+const PARALLEL_SNAP_ANGLE_TOL_DEG = 6;
+function findParallelSnapPoint(anchor, rawX, rawY, excludeTrackIds) {
+    let dx = rawX - anchor.x, dy = rawY - anchor.y;
+    let rawLen = Math.hypot(dx, dy);
+    if (rawLen < 1e-6) return null;
+
+    let angle = Math.atan2(dy, dx);
+    let step = Math.PI / 4;
+    let snappedAngle = Math.round(angle / step) * step;
+    let diffDeg = Math.abs(angle - snappedAngle) * 180 / Math.PI;
+    // Only the true 45-degree diagonals need this help - axis-aligned (0/90)
+    // segments already land cleanly on the plain square grid by themselves.
+    let stepsFrom0 = Math.round(snappedAngle / step);
+    let isDiagonal45 = (((stepsFrom0 % 2) + 2) % 2) === 1;
+    if (diffDeg > PARALLEL_SNAP_ANGLE_TOL_DEG || !isDiagonal45) return null;
+
+    let dirx = Math.cos(snappedAngle), diry = Math.sin(snappedAngle);
+    let angleTolSin = Math.sin(PARALLEL_SNAP_ANGLE_TOL_DEG * Math.PI / 180);
+    let distThresh = Math.max(10, gridSize * 0.6);
+
+    let best = null, bestDist = distThresh;
+    for (let t of state.tracks) {
+        if (excludeTrackIds && excludeTrackIds.includes(t.id)) continue;
+        let p1 = getPoint(t.p1_id), p2 = getPoint(t.p2_id);
+        if (!p1 || !p2) continue;
+        let tdx = p2.x - p1.x, tdy = p2.y - p1.y;
+        let tlen = Math.hypot(tdx, tdy);
+        if (tlen < 1e-6) continue;
+        let tux = tdx / tlen, tuy = tdy / tlen;
+
+        // Parallel check (a line and its reverse direction both count).
+        let cross = Math.abs(dirx * tuy - diry * tux);
+        if (cross > angleTolSin) continue;
+
+        // Perpendicular distance from the anchor to this track's infinite line.
+        let nx = -tuy, ny = tux;
+        let distAnchor = Math.abs((anchor.x - p1.x) * nx + (anchor.y - p1.y) * ny);
+        if (distAnchor < bestDist) {
+            bestDist = distAnchor;
+            best = { p1, nx, ny };
+        }
+    }
+    if (!best) return null;
+
+    // Snap the anchor onto that line (it's already close - this just removes
+    // the residual few-pixel error), then walk along the clean 45-degree
+    // direction from there, so the whole new segment sits exactly on the
+    // existing line rather than merely ending near it.
+    let anchorOffset = (anchor.x - best.p1.x) * best.nx + (anchor.y - best.p1.y) * best.ny;
+    let correctedAnchor = { x: anchor.x - anchorOffset * best.nx, y: anchor.y - anchorOffset * best.ny };
+    let projLen = (rawX - correctedAnchor.x) * dirx + (rawY - correctedAnchor.y) * diry;
+    let lineStep = gridStepForDirection({ x: dirx, y: diry });
+    let snappedLen = Math.round(projLen / lineStep) * lineStep;
+    return { x: correctedAnchor.x + snappedLen * dirx, y: correctedAnchor.y + snappedLen * diry };
+}
+
+// A direction that runs at an odd multiple of 45 degrees (a true diagonal)
+// only lands back on the regular square background grid every
+// gridSize*sqrt(2) it travels - one gridSize step in each of x and y at
+// once. Snapping travel distance to plain gridSize steps along such a
+// direction instead lands *between* grid intersections every other step,
+// which is the "off the grid" look. Axis-aligned directions (0/90/...) don't
+// have this problem and keep using plain gridSize steps.
+function gridStepForDirection(dir) {
+    let angleDeg = Math.atan2(dir.y, dir.x) * 180 / Math.PI;
+    let mod90 = ((angleDeg % 90) + 90) % 90;
+    let isDiagonal = Math.abs(mod90 - 45) < 1;
+    return isDiagonal ? gridSize * Math.SQRT2 : gridSize;
 }
 
 // Computes the pair of new track segments needed to extend the outer/inner
@@ -310,13 +434,42 @@ function solveLineIntersectionParams(u, v, rhs) {
 // the turn getting an extra "extend straight, then turn" leg (a real curve
 // can't have both rails bend at the same point along the direction of
 // travel and stay parallel).
+//
+// The two rails must come out of the turn *level* with each other - i.e. the
+// line connecting the two new endpoints is exactly perpendicular to the new
+// travel direction, matching real parallel track. That only happens if the
+// post-turn leg lengths of the outer and inner rails differ by exactly
+// gapMag*tan(theta/2) (a fixed correction that depends only on the gap and
+// the turn angle, not on how far the player drags) - giving both the same
+// leg length (as the previous version did) leaves them offset by exactly
+// that amount, which is the "both ends don't land on the same
+// perpendicular line" bug.
 function computeDiagonalBuild(mouseX, mouseY) {
     if (!diagOuterPoint || !diagInnerPoint) return null;
     let O = diagOuterPoint, I = diagInnerPoint;
-    let u = pointIncomingDir(I.id) || pointIncomingDir(O.id);
+    let uOuterRaw = pointIncomingDir(O.id);
+    let uInnerRaw = pointIncomingDir(I.id);
+    let u = uInnerRaw || uOuterRaw;
     if (!u) return null;
 
-    let rawDx = mouseX - I.x, rawDy = mouseY - I.y;
+    // If the outer and inner tracks are already (close to) parallel, don't
+    // build the turn off inner's raw angle alone - unify both to a single
+    // clean 45-degree-increment direction first. Two hand-drawn tracks are
+    // rarely pixel-perfect parallel, and basing the whole turn on just one
+    // side's slightly-off angle is exactly what used to make the new outer
+    // and inner segments come out looking offset from one another instead of
+    // sitting on one true 45-degree line.
+    if (uOuterRaw && uInnerRaw && angleBetweenDirsDeg(uOuterRaw, uInnerRaw) <= DIR_SNAP_TOL_DEG) {
+        let unified = snapDirToNearest45(uInnerRaw) || snapDirToNearest45(uOuterRaw);
+        if (unified) u = unified;
+    }
+
+    // Aim relative to whichever point is currently the snap anchor
+    // (right-click during aiming toggles diagAnchorIsOuter), so both the
+    // turn angle and the drag length reflect however the player is
+    // sighting the drag, rather than always being measured from inner.
+    let anchor = diagAnchorIsOuter ? O : I;
+    let rawDx = mouseX - anchor.x, rawDy = mouseY - anchor.y;
     if (Math.hypot(rawDx, rawDy) < 1e-6) return null;
 
     // Snap the aimed direction to the nearest 45-degree increment relative
@@ -329,20 +482,22 @@ function computeDiagonalBuild(mouseX, mouseY) {
     let theta = Math.round(rawAngle / (Math.PI / 4)) * (Math.PI / 4);
     let v = rotateVec(u, theta);
 
-    let p = { x: O.x - I.x, y: O.y - I.y }; // outer's offset from inner
-    let pRot = rotateVec(p, theta); // same offset, rotated - keeps the gap's magnitude
-
     // Length of the new post-turn leg, taken from how far the cursor is
-    // dragged along v and snapped to the grid, with a one-grid-cell minimum.
+    // dragged along v from the anchor point, snapped so the endpoint lands
+    // back on the regular background grid (not just a round distance along
+    // a tilted line), with a one-grid-cell minimum.
+    let step = gridStepForDirection(v);
     let rawLen = rawDx * v.x + rawDy * v.y;
-    let m = Math.round(rawLen / gridSize) * gridSize;
-    if (m < gridSize) m = gridSize;
+    let m = Math.round(rawLen / step) * step;
+    if (m < step) m = step;
 
     let result = { u, v, theta, m, O, I };
 
     if (Math.abs(Math.sin(theta)) < 1e-6) {
         // No actual turn (continuing straight, or exactly reversing) - both
-        // sides just extend directly, no elbow needed.
+        // sides just extend directly, no elbow needed. m is already
+        // relative to whichever side is anchor, but since there's no turn
+        // both sides move by the same v, so it's identical either way.
         result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
         result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
         result.innerSegments = [{ from: I, to: result.I2 }];
@@ -351,37 +506,80 @@ function computeDiagonalBuild(mouseX, mouseY) {
     }
 
     const EPS = 1e-6;
+    let nU = { x: -u.y, y: u.x }; // perpendicular to u
+    let p = { x: O.x - I.x, y: O.y - I.y }; // outer's offset from inner
+    let k = p.x * u.x + p.y * u.y; // how far O leads I along u (can be nonzero even for "parallel" tracks)
+    let gapMag = p.x * nU.x + p.y * nU.y; // true perpendicular gap - independent of any lead/lag above
+    let halfTan = Math.tan(theta / 2);
 
-    // Try "outer extends": outer's pre-turn ray from O (direction u)
-    // intersected with the post-turn line running parallel to inner's own
-    // post-turn ray, offset by the rotated gap pRot.
-    let base1 = { x: I.x + pRot.x, y: I.y + pRot.y };
-    let inter1 = solveLineIntersectionParams(u, v, { x: base1.x - O.x, y: base1.y - O.y });
+    // Exactly which side physically has to run straight a bit further
+    // before turning (the "outside" of this particular curve) is dictated
+    // by the turn geometry alone - a real pair of rails can't choose which
+    // one elbows, only whichever is genuinely on the outside of the curve
+    // can. t and t2 below are always exact negatives of each other, so
+    // whichever is positive tells us which side that is.
+    let t = -k - gapMag * halfTan;
 
-    if (inter1 && inter1.t > EPS) {
-        let Omid = { x: O.x + inter1.t * u.x, y: O.y + inter1.t * u.y };
-        result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
-        result.O2 = { x: Omid.x + m * v.x, y: Omid.y + m * v.y };
+    if (t > EPS) {
+        // Outer is the one that has to run straight for t then elbow onto v.
+        let Omid = { x: O.x + t * u.x, y: O.y + t * u.y };
+        if (diagAnchorIsOuter) {
+            // The player wants OUTER's own leg length to be the clean,
+            // grid-rounded one even though outer is the side doing the
+            // elbowing - measure/round that leg directly from its own
+            // pivot (Omid) instead of from inner, then derive inner's leg
+            // length from the exact level-keeping relationship (inner ends
+            // up carrying the non-round remainder instead).
+            let rawFromOmid = (mouseX - Omid.x) * v.x + (mouseY - Omid.y) * v.y;
+            let mOuter = Math.round(rawFromOmid / step) * step;
+            if (mOuter < step) mOuter = step;
+            let mInner = mOuter + gapMag * halfTan;
+            if (mInner < step) mInner = step;
+            result.O2 = { x: Omid.x + mOuter * v.x, y: Omid.y + mOuter * v.y };
+            result.I2 = { x: I.x + mInner * v.x, y: I.y + mInner * v.y };
+        } else {
+            let mOuter = m - gapMag * halfTan;
+            if (mOuter < step) mOuter = step;
+            result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
+            result.O2 = { x: Omid.x + mOuter * v.x, y: Omid.y + mOuter * v.y };
+        }
         result.innerSegments = [{ from: I, to: result.I2 }];
         result.outerSegments = [{ from: O, to: Omid }, { from: Omid, to: result.O2 }];
         return result;
     }
 
-    // Otherwise try "inner extends" (the turn bends towards the outer
-    // point's side, so the inner point ends up on the outside instead).
-    let base2 = { x: O.x - pRot.x, y: O.y - pRot.y };
-    let inter2 = solveLineIntersectionParams(u, v, { x: base2.x - I.x, y: base2.y - I.y });
-
-    if (inter2 && inter2.t > EPS) {
-        let Imid = { x: I.x + inter2.t * u.x, y: I.y + inter2.t * u.y };
-        result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
-        result.I2 = { x: Imid.x + m * v.x, y: Imid.y + m * v.y };
+    if (t < -EPS) {
+        // Inner is the one that has to run straight for t2 then elbow onto v
+        // (the turn bends towards the outer point's side, so inner ends up
+        // on the outside instead).
+        let t2 = -t;
+        let Imid = { x: I.x + t2 * u.x, y: I.y + t2 * u.y };
+        if (!diagAnchorIsOuter) {
+            // Mirror of the case above: inner elbows, but the player wants
+            // INNER's own leg length to be the clean, grid-rounded one -
+            // measure/round it from inner's own pivot (Imid), and derive
+            // outer's (non-elbowing) leg length from the exact
+            // level-keeping relationship instead.
+            let rawFromImid = (mouseX - Imid.x) * v.x + (mouseY - Imid.y) * v.y;
+            let mInner = Math.round(rawFromImid / step) * step;
+            if (mInner < step) mInner = step;
+            let mOuter = mInner - gapMag * halfTan;
+            if (mOuter < step) mOuter = step;
+            result.I2 = { x: Imid.x + mInner * v.x, y: Imid.y + mInner * v.y };
+            result.O2 = { x: O.x + mOuter * v.x, y: O.y + mOuter * v.y };
+        } else {
+            let mInner = m + gapMag * halfTan;
+            if (mInner < step) mInner = step;
+            result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
+            result.I2 = { x: Imid.x + mInner * v.x, y: Imid.y + mInner * v.y };
+        }
         result.outerSegments = [{ from: O, to: result.O2 }];
         result.innerSegments = [{ from: I, to: Imid }, { from: Imid, to: result.I2 }];
         return result;
     }
 
-    // Fallback (shouldn't normally happen once theta != 0): direct both ways.
+    // Fallback (t is ~0 - no elbow correction needed either way): direct
+    // both ways.
     result.I2 = { x: I.x + m * v.x, y: I.y + m * v.y };
     result.O2 = { x: O.x + m * v.x, y: O.y + m * v.y };
     result.innerSegments = [{ from: I, to: result.I2 }];
@@ -454,8 +652,20 @@ function getTrackProjection(wx, wy) {
         let my = wy - p1.y;
         
         let dot = mx * udx + my * udy;
-        
-        let t_dist = Math.round(dot / gridSize) * gridSize;
+        let rawT = Math.max(0, Math.min(len, dot));
+        let rawX = p1.x + udx * rawT;
+        let rawY = p1.y + udy * rawT;
+
+        // Snap onto the actual world grid the point sits on, rather than
+        // stepping a fixed distance from this track's own p1 - p1 isn't
+        // always itself on-grid (e.g. a point left behind by a split or a
+        // diagonal turn can land a fraction off), and stepping from an
+        // off-grid p1 used to carry that offset into every platform/signal
+        // placed on the track, so they'd line up with each other but not
+        // with the grid, and different tracks would disagree with each
+        // other too. Snapping onto the world grid directly fixes both.
+        let snapped = snapPointOntoLine(p1, { x: udx, y: udy }, rawX, rawY);
+        let t_dist = (snapped.x - p1.x) * udx + (snapped.y - p1.y) * udy;
         t_dist = Math.max(0, Math.min(len, t_dist));
         
         let cx = p1.x + udx * t_dist;
@@ -472,6 +682,51 @@ function getTrackProjection(wx, wy) {
         }
     }
     return best;
+}
+
+// Snaps (rawX, rawY) - a point already lying on the infinite line through p1
+// in direction `dir` - onto the nearest point on that same line that also
+// sits on the world grid (the plain square grid shown on screen, or its
+// 45-rotated form for a true diagonal track). This is what makes platform
+// and signal placement always agree with the grid you can see, instead of
+// just being self-consistent along one track.
+function snapPointOntoLine(p1, dir, rawX, rawY) {
+    let angleDeg = Math.atan2(dir.y, dir.x) * 180 / Math.PI;
+    let mod90 = ((angleDeg % 90) + 90) % 90;
+    let isDiagonal = Math.abs(mod90 - 45) < 1;
+
+    if (!isDiagonal) {
+        // Axis-aligned track: only one coordinate actually changes as you
+        // move along it - snap that one straight to the world grid and
+        // recompute the other from the line equation.
+        if (Math.abs(dir.x) >= Math.abs(dir.y)) {
+            let gx = Math.round(rawX / gridSize) * gridSize;
+            if (Math.abs(dir.x) < 1e-9) return { x: gx, y: rawY };
+            let t = (gx - p1.x) / dir.x;
+            return { x: gx, y: p1.y + dir.y * t };
+        } else {
+            let gy = Math.round(rawY / gridSize) * gridSize;
+            if (Math.abs(dir.y) < 1e-9) return { x: rawX, y: gy };
+            let t = (gy - p1.y) / dir.y;
+            return { x: p1.x + dir.x * t, y: gy };
+        }
+    }
+
+    // True 45-degree diagonal: grid intersections along it are spaced
+    // gridSize*sqrt(2) apart. Snap in the grid space rotated 45 degrees
+    // (same trick as snapPointToGrid's diagonal mode) so it lands on those
+    // intersections no matter which diagonal line it is or where its
+    // endpoint happens to sit, then re-project back onto the exact line
+    // since a 2D rotated-grid snap can drift off it by a hair.
+    const cos = Math.cos(Math.PI / 4), sin = Math.sin(Math.PI / 4);
+    let gx = rawX * cos + rawY * sin;
+    let gy = -rawX * sin + rawY * cos;
+    gx = Math.round(gx / gridSize) * gridSize;
+    gy = Math.round(gy / gridSize) * gridSize;
+    let wx = gx * cos - gy * sin;
+    let wy = gx * sin + gy * cos;
+    let t = (wx - p1.x) * dir.x + (wy - p1.y) * dir.y;
+    return { x: p1.x + dir.x * t, y: p1.y + dir.y * t };
 }
 
 function getPlatformGeom(plat) {
@@ -905,6 +1160,7 @@ function resetDiagTool() {
     diagOuterPoint = null;
     diagInnerPoint = null;
     diagPreview = null;
+    diagAnchorIsOuter = false;
     updateDiagHint();
 }
 
@@ -920,7 +1176,8 @@ function updateDiagHint() {
     } else if (diagStage === 1) {
         hintEl.textContent = 'Diagonal Track (45°): now click the INNER track\'s connection point (the parallel track\'s matching endpoint)';
     } else {
-        hintEl.textContent = 'Diagonal Track (45°): move the mouse to aim (snaps to 45° turns) and click to build - the outer track extends first if needed, so the gap stays constant | Esc to restart';
+        let side = diagAnchorIsOuter ? 'OUTER' : 'INNER';
+        hintEl.textContent = 'Diagonal Track (45°): move the mouse to aim (snaps to 45° turns, and locks onto any nearby parallel 45° track so it lines up instead of looking offset) and click to build - the outer track extends first if needed, so the gap stays constant | Right-click to switch which side (currently ' + side + ') snaps onto the grid/parallel track | Esc to restart';
     }
 }
 
@@ -2237,6 +2494,19 @@ canvas.addEventListener('mousedown', (e) => {
     let snappedY = snappedPt.y;
 
     if (e.button === 2) {
+        // While aiming a 45-degree turn with the Diagonal Track tool,
+        // right-click switches which side (outer/inner) is used as the
+        // reference point for snapping the aim onto the grid/a nearby
+        // parallel track, instead of panning the camera.
+        if (mode === 'diag' && diagStage === 2) {
+            diagAnchorIsOuter = !diagAnchorIsOuter;
+            updateDiagHint();
+            let wPos2 = screenToWorld(sx, sy);
+            let aim = getDiagAimPoint(wPos2.x, wPos2.y);
+            diagPreview = computeDiagonalBuild(aim.x, aim.y);
+            draw();
+            return;
+        }
         isDraggingCamera = true;
         lastMouse = { x: sx, y: sy };
         return;
@@ -2267,7 +2537,12 @@ canvas.addEventListener('mousedown', (e) => {
             if (el) deleteElement(el);
         }
         else if (mode === 'track') {
-            let existingPt = getPointAt(snappedX, snappedY);
+            // Prefer snapping onto any existing point within grab range - even
+            // one that's off the background grid - over grid-snapping the
+            // click. This is what lets a new track connect cleanly to a
+            // point placed by the Diagonal Track tool (or dragged off-grid)
+            // instead of missing it and starting a disconnected stub.
+            let existingPt = findNearbyPoint(wPos.x, wPos.y, null) || getPointAt(snappedX, snappedY);
             if (!existingPt) {
                 existingPt = { id: generateId(), x: snappedX, y: snappedY };
                 state.points.push(existingPt);
@@ -2291,7 +2566,8 @@ canvas.addEventListener('mousedown', (e) => {
                     updateDiagHint();
                 }
             } else if (diagStage === 2) {
-                let build = computeDiagonalBuild(wPos.x, wPos.y);
+                let aim = getDiagAimPoint(wPos.x, wPos.y);
+                let build = computeDiagonalBuild(aim.x, aim.y);
                 if (build) {
                     let committed = commitDiagonalBuild(build);
                     if (committed && committed.outer && committed.inner) {
@@ -2464,8 +2740,40 @@ window.addEventListener('mousemove', (e) => {
     let wPos = screenToWorld(sx, sy);
     currentMouseWorld = snapPointToGrid(wPos.x, wPos.y);
 
+    // Freehand 45-degree drawing: if the segment being drawn from the fixed
+    // start point is close to a clean diagonal, and there's an existing track
+    // running along (near enough to) that same line, snap onto it exactly -
+    // the same "line up with what's already there" precision platforms and
+    // signals get for free from being locked to their track.
+    if (mode === 'track' && isDrawing && drawStartPoint) {
+        let snap = findParallelSnapPoint(drawStartPoint, wPos.x, wPos.y, null);
+        if (snap) currentMouseWorld = snap;
+    }
+
+    // Snapping onto an existing point (even one off the background grid)
+    // always wins over grid/parallel-line snapping, so the track can be
+    // aimed precisely at a point that doesn't happen to sit on-grid.
+    if (mode === 'track' && isDrawing && drawStartPoint) {
+        let nearPt = findNearbyPoint(wPos.x, wPos.y, drawStartPoint.id);
+        if (nearPt) currentMouseWorld = { x: nearPt.x, y: nearPt.y };
+    }
+
     if (dragPointId) {
         let p = getPoint(dragPointId);
+        // Same idea while dragging an existing point: if it has exactly one
+        // track hanging off it, treat that track's other end as the anchor
+        // and snap this point back onto any other nearby-parallel 45-degree
+        // line, instead of leaving it a few pixels off.
+        let ownTracks = state.tracks.filter(t => t.p1_id === dragPointId || t.p2_id === dragPointId);
+        if (ownTracks.length === 1) {
+            let anchorTrack = ownTracks[0];
+            let otherId = anchorTrack.p1_id === dragPointId ? anchorTrack.p2_id : anchorTrack.p1_id;
+            let anchor = getPoint(otherId);
+            if (anchor) {
+                let snap = findParallelSnapPoint(anchor, wPos.x, wPos.y, [anchorTrack.id]);
+                if (snap) currentMouseWorld = snap;
+            }
+        }
         p.x = currentMouseWorld.x;
         p.y = currentMouseWorld.y;
     } else if (dragSignalId) {
@@ -2494,12 +2802,33 @@ window.addEventListener('mousemove', (e) => {
         if (diagStage < 2) {
             if (overCanvas) hoverElement = findHoverElement(wPos.x, wPos.y);
         } else {
-            diagPreview = overCanvas ? computeDiagonalBuild(wPos.x, wPos.y) : null;
+            let aim = overCanvas ? getDiagAimPoint(wPos.x, wPos.y) : null;
+            diagPreview = aim ? computeDiagonalBuild(aim.x, aim.y) : null;
         }
     }
     
     draw();
 });
+
+// Shared by the diag tool's live preview (mousemove) and its build click
+// (mousedown), so what gets built always exactly matches what was just
+// previewed. If the aimed new leg is close to a 45-degree increment and
+// passes near some other already-built track's line, the aim point is
+// pulled onto that line - so a diagonal turn can snap into perfect
+// alignment with unrelated nearby track, not just its own outer/inner pair.
+function getDiagAimPoint(mouseX, mouseY) {
+    // Use whichever side is currently selected as the snap anchor (right-click
+    // during aiming toggles this - see diagAnchorIsOuter), falling back to
+    // the other side if that one isn't set yet.
+    let anchor = (diagAnchorIsOuter ? diagOuterPoint : diagInnerPoint) || diagInnerPoint || diagOuterPoint;
+    if (!anchor) return { x: mouseX, y: mouseY };
+    let exclude = state.tracks
+        .filter(t => [t.p1_id, t.p2_id].some(id =>
+            id === anchor.id || (diagOuterPoint && id === diagOuterPoint.id) || (diagInnerPoint && id === diagInnerPoint.id)))
+        .map(t => t.id);
+    let snap = findParallelSnapPoint(anchor, mouseX, mouseY, exclude);
+    return snap || { x: mouseX, y: mouseY };
+}
 
 window.addEventListener('mouseup', (e) => {
     if (e.button === 2) { isDraggingCamera = false; return; }
