@@ -57,13 +57,15 @@ let simTimeSeconds = 5 * 3600 + 50 * 60;
 const DEFAULT_START_TIME = '05:50';
 
 // --- Passenger score ---
-// Counts a passenger exactly once, at the moment they alight at the actual
-// station they were waiting to reach - not merely whenever they get off a
-// train. A one-way line dumps everyone out at its terminus regardless of
-// where they were headed (see handleStopArrival's isTerminus handling), and
-// those forced-off riders haven't completed their trip yet if this isn't
-// really their stop, so they're deliberately excluded here even though they
-// leave the train at the same moment.
+// Counts a passenger exactly once, at the moment they get off a train -
+// either because they've reached the actual station they were waiting to
+// reach, or because a one-way line dumped everyone out at its terminus
+// (see handleStopArrival's isTerminus handling). A forced-off-at-terminus
+// rider hasn't completed their real trip if this isn't their stop, so their
+// contribution to the score is penalized (see PAX_INCOMPLETE_TRIP_FACTOR in
+// groupSatisfaction) rather than excluded outright - on a multi-line
+// network they're still meaningfully served (they can transfer onward),
+// just not as well as someone who rode straight through to their door.
 let totalPassengersDelivered = 0;
 
 // The score shown to the player: each delivered group contributes its own
@@ -75,9 +77,11 @@ let totalPassengerScore = 0;
 function updatePaxScoreDisplay() {
     let el = document.getElementById('pax-score-count');
     if (el) el.textContent = Math.round(totalPassengerScore).toLocaleString();
+    let pct = totalPassengersDelivered > 0 ? Math.round((totalPassengerScore / totalPassengersDelivered) * 100) : 100;
+    let satEl = document.getElementById('pax-score-sat');
+    if (satEl) satEl.textContent = pct + '%';
     let wrap = document.getElementById('pax-score');
     if (wrap) {
-        let pct = totalPassengersDelivered > 0 ? Math.round((totalPassengerScore / totalPassengersDelivered) * 100) : 100;
         wrap.title = totalPassengersDelivered.toLocaleString() + ' passengers delivered \u00b7 ' + pct + '% average satisfaction';
     }
 }
@@ -99,6 +103,14 @@ const PAX_WAIT_WEIGHT = 0.20;
 // wait at all scores 1, linearly in between.
 const PAX_WAIT_SATISFACTION_CAP_S = 10 * 60;
 
+// Multiplier applied to a group's satisfaction when they were forced off at
+// a line's terminus rather than actually reaching their intended station -
+// they still got a ride (and, on a multi-line network, are now free to
+// transfer onward), so they're counted rather than dropped from the score
+// entirely, but a dumped, incomplete trip is worth noticeably less than one
+// that actually delivered them.
+const PAX_INCOMPLETE_TRIP_FACTOR = 0.5;
+
 function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
 // Computes one delivered group's satisfaction (0-1) from the train-level
@@ -108,7 +120,10 @@ function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 // entry and rides together, so this delta is exactly their own trip - see
 // the boardedThisArrival handling in handleStopArrival for why entries
 // from different boarding events are never merged together.
-function groupSatisfaction(train, entry) {
+// `reachedDestination` is false when this group was forced off at a line's
+// terminus instead of actually arriving at their intended station - see
+// PAX_INCOMPLETE_TRIP_FACTOR above.
+function groupSatisfaction(train, entry, reachedDestination) {
     let rideTimeS = (train._paxTimeS || 0) - entry.boardTimeS;
     let rideDistM = (train._paxDistM || 0) - entry.boardDistM;
     let rideEfficientS = (train._paxEfficientS || 0) - entry.boardEfficientS;
@@ -126,7 +141,8 @@ function groupSatisfaction(train, entry) {
 
     let waitScore = clamp01(1 - (entry.waitSeconds || 0) / PAX_WAIT_SATISFACTION_CAP_S);
 
-    return PAX_SPEED_WEIGHT * speedScore + PAX_EFFICIENCY_WEIGHT * efficiencyScore + PAX_WAIT_WEIGHT * waitScore;
+    let score = PAX_SPEED_WEIGHT * speedScore + PAX_EFFICIENCY_WEIGHT * efficiencyScore + PAX_WAIT_WEIGHT * waitScore;
+    return reachedDestination ? score : score * PAX_INCOMPLETE_TRIP_FACTOR;
 }
 
 // Parses a "HH:MM" 24h string into seconds-since-midnight, falling back to
@@ -2161,11 +2177,15 @@ function handleStopArrival(train, stop) {
     let completedTrips = 0;
     train.passengers = train.passengers.filter(entry => {
         let reachedDestination = stationCodes.has(entry.destCode);
-        if (reachedDestination) {
+        if (isTerminus || reachedDestination) {
+            // Counted either way - reaching their real stop, or forced off
+            // at a terminus (still scored, just penalized - see
+            // PAX_INCOMPLETE_TRIP_FACTOR).
             completedTrips += entry.count;
-            totalPassengerScore += groupSatisfaction(train, entry) * entry.count;
+            totalPassengerScore += groupSatisfaction(train, entry, reachedDestination) * entry.count;
+            alighted += entry.count;
+            return false;
         }
-        if (isTerminus || reachedDestination) { alighted += entry.count; return false; }
         return true;
     });
     train.passengerCount = Math.max(0, train.passengerCount - alighted);

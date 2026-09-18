@@ -106,6 +106,15 @@
     color: var(--text);
   }
 
+  .pax-score-sat{
+    font-weight: 600 !important;
+    font-size: 12px !important;
+    color: var(--muted) !important;
+    padding-left: 6px;
+    margin-left: 2px;
+    border-left: 1px solid var(--line);
+  }
+
   .actions{
     display: flex;
     align-items: center;
@@ -966,6 +975,7 @@
           <path d="M12 10c-3.6 0-6.5 2.46-6.5 5.5V19a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-3.5c0-3.04-2.9-5.5-6.5-5.5z"/>
         </svg>
         <span id="pax-score-count">0</span>
+        <span class="pax-score-sat" id="pax-score-sat">100%</span>
       </div>
     </div>
     <div class="actions">
@@ -1232,7 +1242,7 @@
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="game.js?v=20"></script>
-  <script src="net.js?v=20"></script>
+  <script src="game.js?v=21"></script>
+  <script src="net.js?v=21"></script>
 </body>
 </html>
