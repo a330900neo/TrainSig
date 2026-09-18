@@ -66,9 +66,67 @@ const DEFAULT_START_TIME = '05:50';
 // leave the train at the same moment.
 let totalPassengersDelivered = 0;
 
+// The score shown to the player: each delivered group contributes its own
+// satisfaction (0-1, see groupSatisfaction) times how many people were in
+// it, rather than a flat 1 per head - a full train that crawled in late is
+// worth less than the same headcount delivered quickly and smoothly.
+let totalPassengerScore = 0;
+
 function updatePaxScoreDisplay() {
     let el = document.getElementById('pax-score-count');
-    if (el) el.textContent = totalPassengersDelivered.toLocaleString();
+    if (el) el.textContent = Math.round(totalPassengerScore).toLocaleString();
+    let wrap = document.getElementById('pax-score');
+    if (wrap) {
+        let pct = totalPassengersDelivered > 0 ? Math.round((totalPassengerScore / totalPassengersDelivered) * 100) : 100;
+        wrap.title = totalPassengersDelivered.toLocaleString() + ' passengers delivered \u00b7 ' + pct + '% average satisfaction';
+    }
+}
+
+// ============================================================
+// --- Passenger satisfaction ---
+// ============================================================
+// Weights for the three inputs that make up a delivered group's
+// satisfaction score. Efficiency dominates because it's the one measure
+// that isolates avoidable delay (held for a signal, an emergency brake,
+// sitting idle) from delay a passenger would consider perfectly normal
+// (the train actually stopping at stations to let people on and off) - see
+// stepTrainPhysics for exactly which speed reductions count as which.
+const PAX_SPEED_WEIGHT = 0.15;
+const PAX_EFFICIENCY_WEIGHT = 0.65;
+const PAX_WAIT_WEIGHT = 0.20;
+
+// A platform wait this long or longer scores 0 for the wait component; no
+// wait at all scores 1, linearly in between.
+const PAX_WAIT_SATISFACTION_CAP_S = 10 * 60;
+
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+// Computes one delivered group's satisfaction (0-1) from the train-level
+// pax-tracking counters (see stepTrainPhysics) sampled at boarding time
+// (stored on the entry) versus their current values (i.e. at alighting).
+// Every passenger who boards together at the same stop-arrival shares one
+// entry and rides together, so this delta is exactly their own trip - see
+// the boardedThisArrival handling in handleStopArrival for why entries
+// from different boarding events are never merged together.
+function groupSatisfaction(train, entry) {
+    let rideTimeS = (train._paxTimeS || 0) - entry.boardTimeS;
+    let rideDistM = (train._paxDistM || 0) - entry.boardDistM;
+    let rideEfficientS = (train._paxEfficientS || 0) - entry.boardEfficientS;
+    let rideWastedS = (train._paxWastedS || 0) - entry.boardWastedS;
+
+    let avgSpeedMs = rideTimeS > 0 ? rideDistM / rideTimeS : 0;
+    let topSpeedMs = kmhToMs(train.maxSpeedKmh);
+    let speedScore = topSpeedMs > 0 ? clamp01(avgSpeedMs / topSpeedMs) : 0;
+
+    let rideTrackedS = rideEfficientS + rideWastedS;
+    // Zero tracked time (boarded and alighted in the same stop-arrival
+    // event) is a non-ride, not a bad one - default to a perfect score
+    // instead of dividing by zero.
+    let efficiencyScore = rideTrackedS > 0 ? clamp01(rideEfficientS / rideTrackedS) : 1;
+
+    let waitScore = clamp01(1 - (entry.waitSeconds || 0) / PAX_WAIT_SATISFACTION_CAP_S);
+
+    return PAX_SPEED_WEIGHT * speedScore + PAX_EFFICIENCY_WEIGHT * efficiencyScore + PAX_WAIT_WEIGHT * waitScore;
 }
 
 // Parses a "HH:MM" 24h string into seconds-since-midnight, falling back to
@@ -792,8 +850,16 @@ function spawnTrainAt(track, options) {
         emergencyBrake: false,
         autoEmergencyBrake: false,
         homeDepotTrackId: track.id,
-        passengers: [], // [{destCode, count}]
+        passengers: [], // [{destCode, count, waitSeconds, boardTimeS, boardDistM, boardEfficientS, boardWastedS}]
         passengerCount: 0,
+        // Running totals used to score passenger satisfaction (see
+        // groupSatisfaction) - only ever accumulated while passengerCount >
+        // 0, so an empty train deadheading around never affects anyone's
+        // score.
+        _paxDistM: 0,
+        _paxTimeS: 0,
+        _paxEfficientS: 0,
+        _paxWastedS: 0,
         lastAlighted: 0,
         lastBoarded: 0,
         platformOverrides: {},
@@ -1028,6 +1094,18 @@ function stepTrainPhysics(train, dt) {
         // forever after, with nothing left to ever recompute and release it.
         train.autoEmergencyBrake = false;
         train.speedMs = Math.max(0, train.speedMs - train.accelMs2 * dt);
+
+        // Passenger-experience bookkeeping: a train sitting idle (unassigned,
+        // between lines, despawned-and-waiting, etc) with people still
+        // aboard is dead time with no legitimate justification, so it always
+        // counts as wasted rather than efficient - unlike the main branch
+        // below, there's no "legit vs everything else" split to make here.
+        if (train.passengerCount > 0) {
+            train._paxTimeS = (train._paxTimeS || 0) + dt;
+            train._paxDistM = (train._paxDistM || 0) + train.speedMs * dt;
+            train._paxWastedS = (train._paxWastedS || 0) + dt;
+        }
+
         // Actually coast forward while that speed bleeds off, instead of
         // freezing the train's position in place - otherwise the train
         // visually stops dead the instant it goes idle (e.g. right after
@@ -1065,23 +1143,41 @@ function stepTrainPhysics(train, dt) {
 
     let decel = (train.emergencyBrake || train.autoEmergencyBrake) ? train.emergDecelMs2 : train.accelMs2;
 
-    let constraints = [{ d: Infinity, v: kmhToMs(train.maxSpeedKmh) }];
+    // "Legit" constraints are the ones a rider wouldn't hold against the
+    // train: its own top speed, the track's speed limit, a player-set speed
+    // cap, actually approaching a scheduled stop it's meant to make
+    // (cumToTarget), a required turnback, and posted speed zones. The extra
+    // constraints added afterward for the full set - signals held for other
+    // trains, the reverse-outside-a-turnback penalty crawl, and an
+    // emergency brake - represent the train being held up by something
+    // other than doing its job. Any tick where those extra constraints are
+    // the ones actually limiting speed (full desired < legit desired) is
+    // wasted time for anyone aboard rather than efficient time; see the pax
+    // bookkeeping below.
+    let legitConstraints = [{ d: Infinity, v: kmhToMs(train.maxSpeedKmh) }];
     let curLimit = currentTrackSpeedLimitKmh(train);
-    if (curLimit != null) constraints.push({ d: 0, v: kmhToMs(curLimit) });
-    if (train.speedCapKmh != null && train.speedCapKmh >= 0) constraints.push({ d: 0, v: kmhToMs(train.speedCapKmh) });
+    if (curLimit != null) legitConstraints.push({ d: 0, v: kmhToMs(curLimit) });
+    if (train.speedCapKmh != null && train.speedCapKmh >= 0) legitConstraints.push({ d: 0, v: kmhToMs(train.speedCapKmh) });
+    if (lookahead.cumToTarget != null) legitConstraints.push({ d: Math.max(0, lookahead.cumToTarget), v: 0 });
+    for (let rev of lookahead.reversals) {
+        legitConstraints.push({ d: Math.max(0, rev.cum), v: 0 });
+    }
+    for (let zone of lookahead.speedZones) {
+        if (zone.limit != null) legitConstraints.push({ d: Math.max(0, zone.cum), v: kmhToMs(zone.limit) });
+    }
+    let legitDesired = Infinity;
+    for (let c of legitConstraints) {
+        let allowed = Math.sqrt(Math.max(0, c.v * c.v + 2 * decel * c.d));
+        legitDesired = Math.min(legitDesired, allowed);
+    }
+
+    let constraints = legitConstraints.slice();
     // A reversal performed outside a proper turnback/depot area leaves the
     // train crawling until it reverses again - see reverseTrain.
     if (train.reversePenaltyActive) constraints.push({ d: 0, v: kmhToMs(REVERSE_PENALTY_SPEED_KMH) });
     if (train.emergencyBrake) constraints.push({ d: 0, v: 0 });
-    if (lookahead.cumToTarget != null) constraints.push({ d: Math.max(0, lookahead.cumToTarget), v: 0 });
     for (let sig of lookahead.signals) {
         if (sig.state !== 'blue') constraints.push({ d: Math.max(0, sig.cum - SIGNAL_STOP_MARGIN_M), v: 0 });
-    }
-    for (let rev of lookahead.reversals) {
-        constraints.push({ d: Math.max(0, rev.cum), v: 0 });
-    }
-    for (let zone of lookahead.speedZones) {
-        if (zone.limit != null) constraints.push({ d: Math.max(0, zone.cum), v: kmhToMs(zone.limit) });
     }
 
     let desired = Infinity;
@@ -1094,6 +1190,13 @@ function stepTrainPhysics(train, dt) {
     if (desired > v) v = Math.min(desired, v + train.accelMs2 * dt);
     else v = Math.max(desired, v - decel * dt);
     train.speedMs = Math.max(0, v);
+
+    if (train.passengerCount > 0) {
+        train._paxTimeS = (train._paxTimeS || 0) + dt;
+        train._paxDistM = (train._paxDistM || 0) + train.speedMs * dt;
+        if (desired < legitDesired - 1e-6) train._paxWastedS = (train._paxWastedS || 0) + dt;
+        else train._paxEfficientS = (train._paxEfficientS || 0) + dt;
+    }
 
     advanceTrainHead(train, train.speedMs * dt);
 }
@@ -1841,7 +1944,17 @@ function simulatePassengers(dtSimSeconds) {
                     let total = Object.values(waiting).reduce((a, b) => a + b, 0);
                     if (total >= plat.capacity) continue;
                 }
-                waiting[dest] = (waiting[dest] || 0) + 1;
+                // Track a weighted-average "waiting since" time per
+                // destination bucket, used at boarding time to score how
+                // long that group waited (see groupSatisfaction). New
+                // arrivals shift the average toward "now"; the aggregate
+                // model has no per-passenger identity, so this is the best
+                // approximation available of the group's typical wait.
+                let waitSince = plat._waitSince || (plat._waitSince = {});
+                let prevCount = waiting[dest] || 0;
+                let prevSince = waitSince[dest] != null ? waitSince[dest] : simTimeSeconds;
+                waitSince[dest] = (prevSince * prevCount + simTimeSeconds) / (prevCount + 1);
+                waiting[dest] = prevCount + 1;
             }
         }
     }
@@ -1939,11 +2052,21 @@ function rebalancePlatformWaiting() {
                 }
                 if (candidatePlats.includes(p)) continue; // already waiting somewhere that works
                 // This platform doesn't actually go toward destCode (anymore) -
-                // move the whole bucket over to one that does.
+                // move the whole bucket over to one that does, carrying its
+                // wait-start average along so the transfer itself doesn't
+                // reset anyone's wait-time score back to zero.
                 delete waiting[destCode];
+                let waitSinceHere = p._waitSince ? p._waitSince[destCode] : null;
+                if (p._waitSince) delete p._waitSince[destCode];
                 let target = candidatePlats[Math.floor(Math.random() * candidatePlats.length)];
                 let targetWaiting = platformWaiting(target);
-                targetWaiting[destCode] = (targetWaiting[destCode] || 0) + count;
+                let targetPrevCount = targetWaiting[destCode] || 0;
+                if (waitSinceHere != null) {
+                    let targetWaitSince = target._waitSince || (target._waitSince = {});
+                    let existingSince = targetWaitSince[destCode] != null ? targetWaitSince[destCode] : waitSinceHere;
+                    targetWaitSince[destCode] = (existingSince * targetPrevCount + waitSinceHere * count) / (targetPrevCount + count);
+                }
+                targetWaiting[destCode] = targetPrevCount + count;
             }
         }
     }
@@ -2038,7 +2161,10 @@ function handleStopArrival(train, stop) {
     let completedTrips = 0;
     train.passengers = train.passengers.filter(entry => {
         let reachedDestination = stationCodes.has(entry.destCode);
-        if (reachedDestination) completedTrips += entry.count;
+        if (reachedDestination) {
+            completedTrips += entry.count;
+            totalPassengerScore += groupSatisfaction(train, entry) * entry.count;
+        }
         if (isTerminus || reachedDestination) { alighted += entry.count; return false; }
         return true;
     });
@@ -2069,10 +2195,19 @@ function handleStopArrival(train, stop) {
     // they're going.
     let boarded = 0;
     let plat = getPlatform(train.pendingPlatformId);
+    // Keyed by destCode, but only for entries created during THIS
+    // stop-arrival - an entry already aboard from an earlier stop has a
+    // different (earlier) boarding snapshot, so it must never be merged
+    // with a fresh one even if it happens to share a destination. Multiple
+    // platforms at the same stop boarding the same destCode in this one
+    // pass do share an identical snapshot (nothing has moved in between),
+    // so those are fine to combine.
+    let boardedThisArrival = {};
     if (plat && line) {
         let fromStationCode = plat.stationCode;
         for (let srcPlat of stopPlatforms) {
             let waiting = platformWaiting(srcPlat);
+            let waitSince = srcPlat._waitSince || (srcPlat._waitSince = {});
             for (let destCode of Object.keys(waiting)) {
                 if (train.passengerCount >= train.capacity) break;
                 if (stationCodes.has(destCode)) continue; // already home, wouldn't have been waiting for this train anyway
@@ -2081,12 +2216,27 @@ function handleStopArrival(train, stop) {
                 if (!(avail > 0)) continue;
                 let room = train.capacity - train.passengerCount;
                 let board = Math.min(avail, room);
+                let waitStart = waitSince[destCode] != null ? waitSince[destCode] : simTimeSeconds;
+                let waitSeconds = Math.max(0, simTimeSeconds - waitStart);
                 waiting[destCode] -= board;
-                if (waiting[destCode] <= 0) delete waiting[destCode];
+                if (waiting[destCode] <= 0) { delete waiting[destCode]; delete waitSince[destCode]; }
                 train.passengerCount += board;
                 boarded += board;
-                let existing = train.passengers.find(e => e.destCode === destCode);
-                if (existing) existing.count += board; else train.passengers.push({ destCode, count: board });
+                let existing = boardedThisArrival[destCode];
+                if (existing) {
+                    existing.waitSeconds = (existing.waitSeconds * existing.count + waitSeconds * board) / (existing.count + board);
+                    existing.count += board;
+                } else {
+                    existing = {
+                        destCode, count: board, waitSeconds,
+                        boardTimeS: train._paxTimeS || 0,
+                        boardDistM: train._paxDistM || 0,
+                        boardEfficientS: train._paxEfficientS || 0,
+                        boardWastedS: train._paxWastedS || 0
+                    };
+                    boardedThisArrival[destCode] = existing;
+                    train.passengers.push(existing);
+                }
             }
         }
     }
@@ -4241,7 +4391,7 @@ function resetGameState() {
     adjustRouteDragging = false;
     adjustDragPointerId = null;
     adjustRoutePreview = null;
-    state.platforms.forEach(p => { p._waiting = {}; });
+    state.platforms.forEach(p => { p._waiting = {}; p._waitSince = {}; });
     gameOver = false;
     crashAnim = null;
     document.getElementById('gameover-overlay').classList.add('hidden');
@@ -4249,6 +4399,7 @@ function resetGameState() {
     setHint(defaultHint());
 
     totalPassengersDelivered = 0;
+    totalPassengerScore = 0;
     updatePaxScoreDisplay();
 
     simTimeSeconds = parseStartTimeToSeconds(state.meta.startTime);
@@ -4310,7 +4461,7 @@ function loadDiagram(parsed) {
         // signal that can visually never protect anything.
         if (s.direction !== 1 && s.direction !== -1) s.direction = 1;
     });
-    state.platforms.forEach(p => { p._waiting = {}; });
+    state.platforms.forEach(p => { p._waiting = {}; p._waitSince = {}; });
 
     trains = [];
     nextTrainSeq = 1;
@@ -4329,6 +4480,7 @@ function loadDiagram(parsed) {
     setHint(defaultHint());
 
     totalPassengersDelivered = 0;
+    totalPassengerScore = 0;
     updatePaxScoreDisplay();
 
     hasLoadedDiagram = true;
