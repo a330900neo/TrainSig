@@ -640,6 +640,7 @@ const MP = {
         return {
             type: 'STATE_SNAPSHOT',
             simTimeSeconds, simSpeed, simPaused, gameOver,
+            totalPassengersDelivered,
             trains: trains,
             signals: state.signals.map(s => ({ id: s.id, state: s.state })),
             platforms: state.platforms.map(p => ({ id: p.id, waiting: p._waiting || {} })),
@@ -686,7 +687,9 @@ const MP = {
         this.started = true;
         simTimeSeconds = data.simTimeSeconds;
         simSpeed = data.simSpeed;
+        totalPassengersDelivered = 0;
         updateClockDisplay();
+        updatePaxScoreDisplay();
         speedSlider.value = simSpeed;
         speedLabel.textContent = simSpeed + 'x';
         UI.hideOverlay();
@@ -720,6 +723,10 @@ const MP = {
         simSpeed = data.simSpeed;
         simPaused = data.simPaused;
         gameOver = data.gameOver;
+        if (typeof data.totalPassengersDelivered === 'number') {
+            totalPassengersDelivered = data.totalPassengersDelivered;
+            updatePaxScoreDisplay();
+        }
         if (data.crash && data.crash.id !== this.lastCrashEventId) {
             this.lastCrashEventId = data.crash.id;
             gameOver = true;

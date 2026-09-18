@@ -77,6 +77,35 @@
     letter-spacing: 0.01em;
   }
 
+  .pax-score{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    background: rgba(23,23,26,0.9);
+    backdrop-filter: blur(6px);
+    border-radius: 8px;
+    pointer-events: auto;
+  }
+
+  .pax-score-icon{
+    width: 15px;
+    height: 15px;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .pax-score span{
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+    color: var(--text);
+  }
+
   .actions{
     display: flex;
     align-items: center;
@@ -931,6 +960,13 @@
     <div class="brand">
       <img src="../icon.png" alt="">
       <span>TrainSig</span>
+      <div class="pax-score" id="pax-score" title="Total passengers transported">
+        <svg class="pax-score-icon" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="12" cy="5" r="3"/>
+          <path d="M12 10c-3.6 0-6.5 2.46-6.5 5.5V19a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1v-3.5c0-3.04-2.9-5.5-6.5-5.5z"/>
+        </svg>
+        <span id="pax-score-count">0</span>
+      </div>
     </div>
     <div class="actions">
       <a class="back" href="./">&larr; Menu</a>
@@ -1196,7 +1232,7 @@
        push a fix to game.js or net.js, so returning players are guaranteed
        to get the new code instead of a stale cached version. -->
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script src="game.js?v=18"></script>
-  <script src="net.js?v=18"></script>
+  <script src="game.js?v=19"></script>
+  <script src="net.js?v=19"></script>
 </body>
 </html>

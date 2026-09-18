@@ -56,6 +56,21 @@ let hasLoadedDiagram = false;
 let simTimeSeconds = 5 * 3600 + 50 * 60;
 const DEFAULT_START_TIME = '05:50';
 
+// --- Passenger score ---
+// Counts a passenger exactly once, at the moment they alight at the actual
+// station they were waiting to reach - not merely whenever they get off a
+// train. A one-way line dumps everyone out at its terminus regardless of
+// where they were headed (see handleStopArrival's isTerminus handling), and
+// those forced-off riders haven't completed their trip yet if this isn't
+// really their stop, so they're deliberately excluded here even though they
+// leave the train at the same moment.
+let totalPassengersDelivered = 0;
+
+function updatePaxScoreDisplay() {
+    let el = document.getElementById('pax-score-count');
+    if (el) el.textContent = totalPassengersDelivered.toLocaleString();
+}
+
 // Parses a "HH:MM" 24h string into seconds-since-midnight, falling back to
 // the default start time for anything missing/malformed.
 function parseStartTimeToSeconds(hhmm) {
@@ -2020,11 +2035,18 @@ function handleStopArrival(train, stop) {
 
     // Alight.
     let alighted = 0;
+    let completedTrips = 0;
     train.passengers = train.passengers.filter(entry => {
-        if (isTerminus || stationCodes.has(entry.destCode)) { alighted += entry.count; return false; }
+        let reachedDestination = stationCodes.has(entry.destCode);
+        if (reachedDestination) completedTrips += entry.count;
+        if (isTerminus || reachedDestination) { alighted += entry.count; return false; }
         return true;
     });
     train.passengerCount = Math.max(0, train.passengerCount - alighted);
+    if (completedTrips > 0) {
+        totalPassengersDelivered += completedTrips;
+        updatePaxScoreDisplay();
+    }
 
     // Board, from every platform belonging to this stop - not just the one
     // this train physically happens to be docked at. A stop can list more
@@ -3668,6 +3690,7 @@ if (warpMinusBtn) warpMinusBtn.addEventListener('click', () => requestTimeWarp(s
 if (warpPlusBtn) warpPlusBtn.addEventListener('click', () => requestTimeWarp(simSpeed + 1));
 
 updateClockDisplay();
+updatePaxScoreDisplay();
 setPaused(true);
 requestAnimationFrame(simTick);
 
@@ -4225,6 +4248,9 @@ function resetGameState() {
     closeTrainPanel();
     setHint(defaultHint());
 
+    totalPassengersDelivered = 0;
+    updatePaxScoreDisplay();
+
     simTimeSeconds = parseStartTimeToSeconds(state.meta.startTime);
     setPaused(true);
     updateClockDisplay();
@@ -4301,6 +4327,9 @@ function loadDiagram(parsed) {
     document.getElementById('gameover-overlay').classList.add('hidden');
     closeTrainPanel();
     setHint(defaultHint());
+
+    totalPassengersDelivered = 0;
+    updatePaxScoreDisplay();
 
     hasLoadedDiagram = true;
     setEmptyStateVisible(false);
