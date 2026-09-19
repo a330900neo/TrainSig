@@ -2491,39 +2491,44 @@ function draw() {
         if (!geom) continue;
         ctx.save();
         ctx.translate(geom.px, geom.py);
+        ctx.save();
         ctx.rotate(geom.angle);
         ctx.fillStyle = p.color || DEFAULT_PLATFORM_COLOR;
         ctx.strokeStyle = '#9ca3af';
         ctx.lineWidth = 2;
         ctx.fillRect(-PLAT_LENGTH / 2, -PLAT_WIDTH / 2, PLAT_LENGTH, PLAT_WIDTH);
         ctx.strokeRect(-PLAT_LENGTH / 2, -PLAT_WIDTH / 2, PLAT_LENGTH, PLAT_WIDTH);
+        ctx.restore();
 
-        // Number/code label - kept upright on screen no matter how the
-        // platform itself is rotated. Text shares the platform's rotated
-        // frame (translate + rotate(geom.angle) above), so past +/-90deg
-        // from horizontal it would otherwise render upside-down along with
-        // the rectangle. Flipping just the text frame by 180deg in that
-        // case cancels that out; it only swaps which offset (-6 vs 8) ends
-        // up above/below, never the reading direction of the glyphs.
-        ctx.save();
-        if (Math.cos(geom.angle) < 0) ctx.rotate(Math.PI);
+        // Number/code label and the waiting-passenger badge are always
+        // drawn fully upright on screen, independent of the platform's own
+        // rotation - unlike the rectangle above, no ctx.rotate(geom.angle)
+        // is active while these are drawn. Their positions are still
+        // expressed as offsets along the platform's own length/width (as if
+        // in the rotated frame) so they keep tracking the platform's
+        // position and orientation; toWorld() converts such a local offset
+        // into a world-space offset from the platform center by applying
+        // the rotation to the point without rotating the text itself.
+        let cosA = Math.cos(geom.angle), sinA = Math.sin(geom.angle);
+        let toWorld = (lx, ly) => ({ x: lx * cosA - ly * sinA, y: lx * sinA + ly * cosA });
         ctx.fillStyle = '#374151';
         ctx.font = '14px sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         if (p.code) {
-            ctx.fillText(p.number || '', 0, -6);
+            let numPos = toWorld(0, -6);
+            ctx.fillText(p.number || '', numPos.x, numPos.y);
             ctx.font = '10px sans-serif';
-            ctx.fillText(p.code, 0, 8);
+            let codePos = toWorld(0, 8);
+            ctx.fillText(p.code, codePos.x, codePos.y);
         } else {
-            ctx.fillText(p.number || '', 0, 0);
+            let numPos = toWorld(0, 0);
+            ctx.fillText(p.number || '', numPos.x, numPos.y);
         }
-        ctx.restore();
 
-        // Waiting passenger count badge - drawn inside the platform footprint
-        // (same rotated/translated frame as the number above it), pinned to
-        // one end of the platform so it never overlaps the number/code text
-        // which is centered.
+        // Waiting passenger count badge - pinned to one end of the platform
+        // (offset computed in the platform's local frame so it still tracks
+        // the platform's length), but rendered upright like the label above.
         let waiting = p._waiting;
         if (waiting) {
             let total = Object.values(waiting).reduce((a, b) => a + b, 0);
@@ -2532,9 +2537,10 @@ function draw() {
                 ctx.font = 'bold 10px sans-serif';
                 let bw = Math.max(20, ctx.measureText(label).width + 10);
                 let bh = 15;
-                let bx = PLAT_LENGTH / 2 - (bw / 2) - 4;
-                let by = 0;
-                drawRoundedRect(ctx, bx - bw / 2, by - bh / 2, bw, bh, 4);
+                let badgePos = toWorld(PLAT_LENGTH / 2 - (bw / 2) - 4, 0);
+                ctx.save();
+                ctx.translate(badgePos.x, badgePos.y);
+                drawRoundedRect(ctx, -bw / 2, -bh / 2, bw, bh, 4);
                 ctx.fillStyle = 'rgba(15,15,17,0.85)';
                 ctx.fill();
                 ctx.strokeStyle = '#fbbf24';
@@ -2543,7 +2549,8 @@ function draw() {
                 ctx.fillStyle = '#fbbf24';
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText(label, bx, by + 0.5);
+                ctx.fillText(label, 0, 0.5);
+                ctx.restore();
             }
         }
         ctx.restore();
